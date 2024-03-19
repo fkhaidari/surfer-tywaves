@@ -131,7 +131,7 @@ pub enum ValueKind {
 
 /// The representation of the value, compound values can be
 /// be represented by the repr of their subfields
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ValueRepr {
     Bit(char),
     /// The value is `.0` raw bits, and can be translated by further translators

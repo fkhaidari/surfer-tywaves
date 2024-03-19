@@ -101,12 +101,15 @@ impl TywavesTranslator {
 
     fn translate_realtype(
         &self,
-        real_type: &symbol_table::RealType,
+        variable: &symbol_table::Variable,
         raw_val_vcd: &str,
     ) -> Result<TranslationResult> {
+
+        let real_type = &variable.real_type;
+        let val = ValueRepr::String(variable.create_val_repr(raw_val_vcd));
         let result = match real_type {
-            symbol_table::RealType::Ground { width, .. } => {
-                let val = ValueRepr::String(raw_val_vcd.to_string());
+            symbol_table::RealType::Ground { .. } => {
+                println!("val: {:?}", val);
                 let subfields = vec![];
                 let kind = ValueKind::Normal; // TODO!: change this to use the correct value
                 TranslationResult {
@@ -115,17 +118,17 @@ impl TywavesTranslator {
                     kind,
                 }
             }
-            symbol_table::RealType::Bundle { fields, vcd_name } => {
+            symbol_table::RealType::Bundle { fields, .. } => {
                 // Collect the subfields of the bundle
                 let mut subfields = vec![];
 
                 let mut _raw_val_vcd = raw_val_vcd;
-                //let mut val = "0";
+                let mut _val = "0";
                 for field in fields {
                     // Get the value of the subfield
-                    let (val, _raw_val_vcd) = self.get_sub_raw_val(&field.real_type, _raw_val_vcd);
-                    println!("val: {}, raw_val_vcd: {}", val, raw_val_vcd);
-                    let value_repr = ValueRepr::String(val.to_string());
+                    (_val, _raw_val_vcd) = self.get_sub_raw_val(&field.real_type, _raw_val_vcd);
+                    println!("val: {}, raw_val_vcd: {}", _val, _raw_val_vcd);
+                    let value_repr = ValueRepr::String(_val.to_string());
                     let subfield = TranslationResult {
                         val: value_repr,
                         subfields: vec![],
@@ -137,7 +140,7 @@ impl TywavesTranslator {
                     ));
                 }
                 TranslationResult {
-                    val: ValueRepr::String(raw_val_vcd.to_string()),
+                    val,
                     subfields,
                     kind: ValueKind::Normal,
                 }
@@ -181,9 +184,12 @@ impl Translator for TywavesTranslator {
 
         // Extract the raw value from the vcd in binary format
         let raw_val_vcd = match value {
-            VariableValue::BigUint(v) => format!("{v:b}"),
+            VariableValue::BigUint(v) => format!("{v:0b}"),
             VariableValue::String(v) => v.clone(),
         };
+
+        // Add extra bits 
+        let raw_val_vcd = format!("{:0>width$}", raw_val_vcd, width = var.real_type.find_width() as usize);
 
         // let value_repr: ValueRepr = ValueRepr::String(&raw_val_vcd);
         // let subfields = vec![];
@@ -195,7 +201,7 @@ impl Translator for TywavesTranslator {
         // };
 
         let parent_var = var;
-        self.translate_realtype(&parent_var.real_type, &raw_val_vcd)
+        self.translate_realtype(&parent_var, &raw_val_vcd)
         // Err(eyre!("Not implemented"))
     }
 
