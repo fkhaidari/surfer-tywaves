@@ -4,11 +4,11 @@ use color_eyre::Result;
 use eframe::epaint::Color32;
 
 mod basic_translators;
-pub mod tywaves_translator;
 pub mod clock;
 mod enum_translator;
 pub mod numeric_translators;
 pub mod spade;
+pub mod tywaves_translator;
 
 pub use basic_translators::*;
 use itertools::Itertools;
@@ -118,7 +118,7 @@ impl TranslatorList {
     }
 }
 
-#[derive(Clone, PartialEq, Copy)]
+#[derive(Clone, PartialEq, Copy, Debug)]
 pub enum ValueKind {
     Normal,
     Undef,
@@ -156,7 +156,7 @@ pub enum ValueRepr {
     NotPresent,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct TranslatedValue {
     pub value: String,
     pub kind: ValueKind,
@@ -178,7 +178,7 @@ impl TranslatedValue {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SubFieldFlatTranslationResult {
     pub names: Vec<String>,
     pub value: Option<TranslatedValue>,
@@ -393,12 +393,18 @@ impl VariableInfo {
         match path {
             [] => self,
             [field, rest @ ..] => match self {
-                VariableInfo::Compound { subfields } => subfields
-                    .iter()
-                    .find(|(f, _)| f == field)
-                    .unwrap()
-                    .1
-                    .get_subinfo(rest),
+                VariableInfo::Compound { subfields } => {
+                    println!("field: {:?}", field);
+                    subfields
+                        .iter()
+                        .find(|(f, _)| {
+                            println!("f: {:?}", f);
+                            f == field
+                        })
+                        .unwrap()
+                        .1
+                        .get_subinfo(rest)
+                }
                 VariableInfo::Bits => panic!(),
                 VariableInfo::Bool => panic!(),
                 VariableInfo::Clock => panic!(),
