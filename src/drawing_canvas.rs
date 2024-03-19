@@ -177,7 +177,7 @@ fn variable_draw_commands(
                 translators,
             )
             .as_fields();
-        println!("fields: {:?}", &fields);
+
         for SubFieldFlatTranslationResult { names, value } in fields {
             let prev = prev_values.get(&names);
 
