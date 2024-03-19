@@ -1,13 +1,17 @@
+use std::fmt::Debug;
+use std::os::unix::raw;
 use std::sync::mpsc::Sender;
 
 use camino::Utf8Path;
+use ron::value;
+use spade_mir::value_name;
 
 use crate::message::Message;
-use crate::translation::Translator;
+use crate::translation::{Translator, ValueKind, ValueRepr};
 use crate::wasm_util::perform_work;
 use crate::wave_container::{VariableMeta, VariableValue};
 
-use tywaves::symbol_table;
+use tywaves::symbol_table::{self, RealType};
 use tywaves::tywaves_state::TywaveState;
 use tywaves::variable_finder::VariableFinder;
 
@@ -26,7 +30,7 @@ impl From<&symbol_table::RealType> for VariableInfo {
                     VariableInfo::Bits
                 }
             }
-            symbol_table::RealType::Bundle { fields } => VariableInfo::Compound {
+            symbol_table::RealType::Bundle { fields, vcd_name } => VariableInfo::Compound {
                 subfields: fields
                     .iter()
                     .map(|f| (f.name.clone(), Self::from(&f.real_type)))
@@ -81,6 +85,83 @@ impl TywavesTranslator {
             .find_parent_variable(&path)
             .ok_or(eyre!("Parent variable not found in the state: {:?}", path))
     }
+
+    fn get_sub_raw_val<'a>(
+        &self,
+        subfield_t: &RealType,
+        raw_val_vcd: &'a str,
+    ) -> (&'a str, &'a str) {
+        // Get size of real type
+        let size = subfield_t.find_width() as usize;
+        if raw_val_vcd.len() < size {
+            return ("0", raw_val_vcd);
+        }
+        (&raw_val_vcd[..size], &raw_val_vcd[size..])
+    }
+
+    fn translate_realtype(
+        &self,
+        real_type: &symbol_table::RealType,
+        raw_val_vcd: &str,
+    ) -> Result<TranslationResult> {
+        let result = match real_type {
+            symbol_table::RealType::Ground { width, .. } => {
+                let val = ValueRepr::String(raw_val_vcd.to_string());
+                let subfields = vec![];
+                let kind = ValueKind::Normal; // TODO!: change this to use the correct value
+                TranslationResult {
+                    val,
+                    subfields,
+                    kind,
+                }
+            }
+            symbol_table::RealType::Bundle { fields, vcd_name } => {
+                // Collect the subfields of the bundle
+                let mut subfields = vec![];
+
+                let mut _raw_val_vcd = raw_val_vcd;
+                //let mut val = "0";
+                for field in fields {
+                    // Get the value of the subfield
+                    let (val, _raw_val_vcd) = self.get_sub_raw_val(&field.real_type, _raw_val_vcd);
+                    println!("val: {}, raw_val_vcd: {}", val, raw_val_vcd);
+                    let value_repr = ValueRepr::String(val.to_string());
+                    let subfield = TranslationResult {
+                        val: value_repr,
+                        subfields: vec![],
+                        kind: ValueKind::Normal,
+                    };
+                    subfields.push(super::SubFieldTranslationResult::new(
+                        field.name.clone(),
+                        subfield,
+                    ));
+                }
+                TranslationResult {
+                    val: ValueRepr::String(raw_val_vcd.to_string()),
+                    subfields,
+                    kind: ValueKind::Normal,
+                }
+            }
+            symbol_table::RealType::Vec { .. } => {
+                // let value_repr = ValueRepr::String(raw_val_vcd.to_string());
+                // let subfields = vec![];
+                // let kind = ValueKind::Normal;
+                // TranslationResult {
+                //     val: value_repr,
+                //     subfields,
+                //     kind,
+                // }
+                todo!("Vec type not implemented")
+            }
+            _ => TranslationResult {
+                val: ValueRepr::String(raw_val_vcd.to_string()),
+                subfields: vec![],
+                kind: ValueKind::Undef,
+            },
+        };
+        Ok(result)
+        // Err(eyre!("Not implemented"))
+    }
 }
 
 impl Translator for TywavesTranslator {
@@ -93,20 +174,40 @@ impl Translator for TywavesTranslator {
         variable: &VariableMeta,
         value: &VariableValue,
     ) -> Result<TranslationResult> {
+        let var = self.find_variable(variable)?;
+        // println!("Variable: {:?}", var);
+        let parent_var = self.find_parent_variable(variable)?;
+        // println!("Parent Variable: {:?}", parent_var);
 
-  
-        todo!("Translate to implement")
+        // Extract the raw value from the vcd in binary format
+        let raw_val_vcd = match value {
+            VariableValue::BigUint(v) => format!("{v:b}"),
+            VariableValue::String(v) => v.clone(),
+        };
+
+        // let value_repr: ValueRepr = ValueRepr::String(&raw_val_vcd);
+        // let subfields = vec![];
+        // let kind = ValueKind::Normal;
+        // let result = TranslationResult {
+        //     val: value_repr,
+        //     subfields,
+        //     kind,
+        // };
+
+        let parent_var = var;
+        self.translate_realtype(&parent_var.real_type, &raw_val_vcd)
+        // Err(eyre!("Not implemented"))
     }
 
     fn variable_info(&self, variable: &VariableMeta) -> Result<VariableInfo> {
         let var = self.find_variable(variable)?;
         println!("Variable: {:?}", var);
         let parent_var = self.find_parent_variable(variable)?;
-        println!("Parent Variable: {:?}", parent_var);
-
+        // println!("Parent Variable: {:?}", parent_var);
+        let parent_var = var;
         // Convert parent var to VariableInfo
         let parent_var_info = VariableInfo::from(&parent_var.real_type);
-        println!("Parent Variable Info: {:?}", parent_var_info);
+        // println!("Parent Variable Info: {:?}", parent_var_info);
         Ok(parent_var_info)
         // todo!("VariableInfo to implement")
     }
@@ -114,9 +215,12 @@ impl Translator for TywavesTranslator {
     // Tell if the variable can be translated or not
     fn translates(&self, variable: &VariableMeta) -> Result<TranslationPreference> {
         // Get the type of the selected variable
-        let var_from_symbol_table = &self.find_variable(variable);
+        if let Ok(_) = &self.find_variable(variable) {
+            Ok(TranslationPreference::Prefer)
+        } else {
+            Ok(TranslationPreference::No)
+        }
 
-        Ok(TranslationPreference::Prefer)
         // todo!()
     }
 }
