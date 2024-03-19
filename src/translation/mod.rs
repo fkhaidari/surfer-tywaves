@@ -4,6 +4,7 @@ use color_eyre::Result;
 use eframe::epaint::Color32;
 
 mod basic_translators;
+pub mod tywaves_translator;
 pub mod clock;
 mod enum_translator;
 pub mod numeric_translators;
