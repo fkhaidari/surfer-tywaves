@@ -279,7 +279,7 @@ fn main() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Surfer")
+            .with_title("Surfer-tywaves demo")
             .with_inner_size(egui::Vec2::new(
                 state.config.layout.window_width as f32,
                 state.config.layout.window_height as f32,
@@ -288,7 +288,7 @@ fn main() -> Result<()> {
     };
 
     eframe::run_native(
-        "Surfer",
+        "Surfer-tywaves demo",
         options,
         Box::new(|cc| {
             let ctx_arc = Arc::new(cc.egui_ctx.clone());
