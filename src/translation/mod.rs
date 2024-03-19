@@ -393,18 +393,12 @@ impl VariableInfo {
         match path {
             [] => self,
             [field, rest @ ..] => match self {
-                VariableInfo::Compound { subfields } => {
-                    println!("field: {:?}", field);
-                    subfields
-                        .iter()
-                        .find(|(f, _)| {
-                            println!("f: {:?}", f);
-                            f == field
-                        })
-                        .unwrap()
-                        .1
-                        .get_subinfo(rest)
-                }
+                VariableInfo::Compound { subfields } => subfields
+                    .iter()
+                    .find(|(f, _)| f == field)
+                    .unwrap()
+                    .1
+                    .get_subinfo(rest),
                 VariableInfo::Bits => panic!(),
                 VariableInfo::Bool => panic!(),
                 VariableInfo::Clock => panic!(),

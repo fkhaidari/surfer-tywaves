@@ -109,7 +109,6 @@ impl TywavesTranslator {
         let val = ValueRepr::String(variable.create_val_repr(raw_val_vcd));
         let result = match real_type {
             symbol_table::RealType::Ground { width, .. } => {
-                println!("----------->val: {:?}", val);
                 let mut subfields = vec![];
                 for i in 0..(*width) as usize {
                     let subfield = TranslationResult {
@@ -148,10 +147,7 @@ impl TywavesTranslator {
                 for field in fields {
                     // Get the value of the subfield
                     (_val, _raw_val_vcd) = self.get_sub_raw_val(&field.real_type, _raw_val_vcd);
-                    println!(
-                        " from translator: {}  {}, val: {}, raw_val_vcd: {}",
-                        &field.name, &field.real_type, _val, _raw_val_vcd
-                    );
+                  
                     // let value_repr = ValueRepr::String(field.create_val_repr(&_val));
                     // let subfield = TranslationResult {
                     //     val: value_repr,
