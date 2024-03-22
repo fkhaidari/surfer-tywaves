@@ -147,7 +147,7 @@ impl TywavesTranslator {
                 for field in fields {
                     // Get the value of the subfield
                     (_val, _raw_val_vcd) = self.get_sub_raw_val(&field.real_type, _raw_val_vcd);
-                  
+
                     // let value_repr = ValueRepr::String(field.create_val_repr(&_val));
                     // let subfield = TranslationResult {
                     //     val: value_repr,
