@@ -3,6 +3,7 @@ $date Fri Mar 15 12:18:41 2024 $end
 $timescale 1ms $end
 
   $scope module Foo $end
+  
    $var wire  1 # clock [0:0] $end
    $var wire  3 r io [2:0] $end
    $var wire  17 ' inputSum [16:0] $end

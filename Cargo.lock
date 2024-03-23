@@ -4924,6 +4924,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_stacker",
+ "vcd 0.7.0",
 ]
 
 [[package]]
@@ -5039,6 +5040,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84a5ed196124bf3bb32418e5f79cd7548a455500bba37e094f7ef4cfe91161fc"
 
 [[package]]
+name = "vcd"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4505774fc84de82eb04caa74d859342b0daa376f4c6df45149593245dd62c004"
+
+[[package]]
 name = "vcd-translate"
 version = "0.1.0"
 dependencies = [
@@ -5054,7 +5061,7 @@ dependencies = [
  "spade-mir",
  "spade-typeinference",
  "spade-types",
- "vcd",
+ "vcd 0.6.1",
 ]
 
 [[package]]

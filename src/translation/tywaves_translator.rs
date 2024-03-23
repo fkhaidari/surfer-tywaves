@@ -47,6 +47,9 @@ pub struct TywavesTranslator {
 }
 
 impl TywavesTranslator {
+    pub fn get_state(&self) -> &TywaveState {
+        &self.state
+    }
     pub fn new(state_file: &Utf8Path) -> Result<Self> {
         // Parse the state file using serde and initialize the TywavesTranslator
         let state_file = std::fs::read_to_string(state_file)?;

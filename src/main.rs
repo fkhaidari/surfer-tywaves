@@ -100,6 +100,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -572,6 +573,7 @@ impl State {
         self.previous_waves = self.waves;
         self.waves = None;
 
+        let chisel_state = args.chisel_state.clone();
         // Long running translators which we load in a thread
         {
             #[cfg(feature = "spade")]
@@ -597,9 +599,19 @@ impl State {
 
         match args.waves {
             Some(WaveSource::Url(url)) => self.load_vcd_from_url(url, LoadOptions::clean()),
-            Some(WaveSource::File(file)) => self
-                .load_wave_from_file(file, LoadOptions::clean())
-                .unwrap(),
+            Some(WaveSource::File(file)) => {
+                let file = if let Some(chisel_state) = chisel_state {
+                    let translator = TywavesTranslator::new(&chisel_state).unwrap();
+                    let file = translator
+                        .get_state()
+                        .vcd_rewrite_surfer(file.as_std_path());
+                    Utf8PathBuf::from_path_buf(PathBuf::from(file)).unwrap()
+                } else {
+                    file
+                };
+                self.load_wave_from_file(file, LoadOptions::clean())
+                    .unwrap()
+            }
             Some(WaveSource::Data) => error!("Attempted to load data at startup"),
             #[cfg(not(target_arch = "wasm32"))]
             Some(WaveSource::CxxrtlTcp(url)) => {
