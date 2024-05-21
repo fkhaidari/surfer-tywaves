@@ -8,9 +8,9 @@ use crate::translation::{Translator, ValueKind, ValueRepr};
 use crate::wasm_util::perform_work;
 use crate::wave_container::{VariableMeta, VariableValue};
 
-use tywaves::symbol_table::{self, RealType};
-use tywaves::tywaves_state::TywaveState;
-use tywaves::variable_finder::VariableFinder;
+use tywaves_rs::symbol_table::{self, RealType};
+use tywaves_rs::tywaves_state::TywaveState;
+use tywaves_rs::variable_finder::VariableFinder;
 
 use super::{TranslationPreference, TranslationResult, VariableInfo};
 
@@ -21,11 +21,11 @@ impl From<&symbol_table::RealType> for VariableInfo {
     fn from(real_type: &symbol_table::RealType) -> Self {
         match real_type {
             symbol_table::RealType::Ground { width, .. } => {
-                if *width == 1 {
+                if width.get() == 1 {
                     VariableInfo::Bool
                 } else {
                     let mut subfields = vec![];
-                    for i in 0..*width {
+                    for i in 0..width.get() {
                         subfields.push((i.to_string(), VariableInfo::Bool));
                     }
                     VariableInfo::Compound { subfields }
@@ -113,7 +113,7 @@ impl TywavesTranslator {
         let result = match real_type {
             symbol_table::RealType::Ground { width, .. } => {
                 let mut subfields = vec![];
-                for i in 0..(*width) as usize {
+                for i in 0..(width.get()) as usize {
                     let subfield = TranslationResult {
                         val: ValueRepr::String(raw_val_vcd.chars().nth(i).unwrap().to_string()),
                         subfields: vec![],
