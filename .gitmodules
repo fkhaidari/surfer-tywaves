@@ -10,3 +10,6 @@
 [submodule "waveform"]
 	path = wellen
 	url = https://github.com/ekiwi/waveform-rust.git
+[submodule "tywaves-rs"]
+	path = tywaves-rs
+	url = https://github.com/rameloni/tywaves-rs

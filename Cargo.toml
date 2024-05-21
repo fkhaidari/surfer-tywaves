@@ -60,7 +60,7 @@ vcd-translate = { path = "spade/vcd-translate", optional = true }
 web-sys = { version = "0.3.66", features = ["Location", "UrlSearchParams"] }
 wellen = { path = "wellen" }
 
-tywaves = { path = "tywaves" }
+tywaves = { path = "tywaves-rs" }
 
 [features]
 default = ["spade", "performance_plot"]
