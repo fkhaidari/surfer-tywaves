@@ -76,6 +76,7 @@ use serde::Serialize;
 use time::TimeStringFormatting;
 use time::TimeUnit;
 use translation::all_translators;
+use translation::tywaves_translator;
 use translation::tywaves_translator::TywavesTranslator;
 
 #[cfg(feature = "spade")]
@@ -118,8 +119,12 @@ struct Args {
     #[clap(long)]
     spade_top: Option<String>,
 
-    #[clap(long)]
-    chisel_state: Option<Utf8PathBuf>,
+    /// Path to a directory containing the hgldd files for the design.
+    /// NOTE: For now, only a directory containing the hgldd files is supported.
+    /// In the future a command line option to specify a list of 1 or more hgldd files
+    /// will be added.
+    #[clap(long, verbatim_doc_comment)]
+    hgldd_dir: Option<Utf8PathBuf>,
 
     /// Path to a file containing 'commands' to run after a waveform has been loaded.
     /// The commands are the same as those used in the command line interface inside the program.
@@ -154,7 +159,7 @@ impl Args {
 struct StartupParams {
     pub spade_state: Option<Utf8PathBuf>,
     pub spade_top: Option<String>,
-    pub chisel_state: Option<Utf8PathBuf>,
+    pub hgldd_dir: Option<Utf8PathBuf>,
     pub waves: Option<WaveSource>,
     pub startup_commands: Vec<String>,
 }
@@ -165,7 +170,7 @@ impl StartupParams {
         Self {
             spade_state: None,
             spade_top: None,
-            chisel_state: None,
+            hgldd_dir: None,
             waves: None,
             startup_commands: vec![],
         }
@@ -176,7 +181,7 @@ impl StartupParams {
         Self {
             spade_state: None,
             spade_top: None,
-            chisel_state: None,
+            hgldd_dir: None,
             waves: url.load_url.map(WaveSource::Url),
             startup_commands: url.startup_commands.map(|c| vec![c]).unwrap_or_default(),
         }
@@ -196,7 +201,7 @@ impl StartupParams {
         Self {
             spade_state: args.spade_state,
             spade_top: args.spade_top,
-            chisel_state: args.chisel_state,
+            hgldd_dir: args.hgldd_dir,
             waves: args.wave_file.map(|s| string_to_wavesource(&s)),
             startup_commands,
         }
@@ -277,10 +282,10 @@ fn main() -> Result<()> {
         None => State::new()?,
     }
     .with_params(StartupParams::from_args(args));
-
+    let app_name = "Surfer-tywaves v0.3.0";
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Surfer-tywaves demo")
+            .with_title(app_name)
             .with_inner_size(egui::Vec2::new(
                 state.config.layout.window_width as f32,
                 state.config.layout.window_height as f32,
@@ -289,7 +294,7 @@ fn main() -> Result<()> {
     };
 
     eframe::run_native(
-        "Surfer-tywaves demo",
+        app_name,
         options,
         Box::new(|cc| {
             let ctx_arc = Arc::new(cc.egui_ctx.clone());
@@ -573,8 +578,8 @@ impl State {
         self.previous_waves = self.waves;
         self.waves = None;
 
-        let chisel_state = args.chisel_state.clone();
-        // Long running translators which we load in a thread
+        let hgldd_dir = args.hgldd_dir.clone(); // Copy for the closure
+                                                // Long running translators which we load in a thread
         {
             #[cfg(feature = "spade")]
             let sender = self.sys.channels.msg_sender.clone();
@@ -585,8 +590,8 @@ impl State {
                 // Here the spade is given
                 if let (Some(top), Some(state)) = (args.spade_top, args.spade_state) {
                     SpadeTranslator::load(&top, &state, sender);
-                } else if let Some(chisel_state) = args.chisel_state {
-                    TywavesTranslator::load(&chisel_state, sender);
+                } else if let Some(hgldd_dir) = args.hgldd_dir {
+                    TywavesTranslator::load(&hgldd_dir, sender);
                 } else {
                     info!("spade-top and spade-state not set, not loading spade translator");
                 }
@@ -599,16 +604,22 @@ impl State {
 
         match args.waves {
             Some(WaveSource::Url(url)) => self.load_vcd_from_url(url, LoadOptions::clean()),
-            Some(WaveSource::File(file)) => {
-                let file = if let Some(chisel_state) = chisel_state {
-                    let translator = TywavesTranslator::new(&chisel_state).unwrap();
-                    let file = translator
-                        .get_state()
-                        .vcd_rewrite_surfer(file.as_std_path());
+            Some(WaveSource::File(wave_file)) => {
+                let file = if let Some(hgldd_dir) = hgldd_dir {
+                    let tywaves_translator = tywaves_translator::TywavesTranslator::new(&hgldd_dir)
+                        .expect("failed to load tywaves translator");
+
+                    // Rewrite the vcd file -> the new wave source
+                    let file = tywaves_translator
+                        .vcd_rewrite(wave_file.as_std_path())
+                        .expect("Vcd file rewrite failed");
+
+                    // Return the new file
                     Utf8PathBuf::from_path_buf(PathBuf::from(file)).unwrap()
                 } else {
-                    file
+                    wave_file
                 };
+
                 self.load_wave_from_file(file, LoadOptions::clean())
                     .unwrap()
             }

@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::mpsc::Sender;
 
 use camino::Utf8Path;
@@ -8,112 +9,143 @@ use crate::translation::{Translator, ValueKind, ValueRepr};
 use crate::wasm_util::perform_work;
 use crate::wave_container::{VariableMeta, VariableValue};
 
-use tywaves_rs::symbol_table::{self, RealType};
-use tywaves_rs::tywaves_state::TywaveState;
-use tywaves_rs::variable_finder::VariableFinder;
-
 use super::{TranslationPreference, TranslationResult, VariableInfo};
 
 use color_eyre::{eyre::eyre, Result}; // Add this line
 
-// TODO: implement the conversion from tywaves types to VariableInfo
-impl From<&symbol_table::RealType> for VariableInfo {
-    fn from(real_type: &symbol_table::RealType) -> Self {
-        match real_type {
-            symbol_table::RealType::Ground { width, .. } => {
-                if width.get() == 1 {
-                    VariableInfo::Bool
-                } else {
-                    let mut subfields = vec![];
-                    for i in 0..width.get() {
-                        subfields.push((i.to_string(), VariableInfo::Bool));
-                    }
-                    VariableInfo::Compound { subfields }
-                }
-            }
-            symbol_table::RealType::Bundle { fields, .. } => VariableInfo::Compound {
-                subfields: fields
-                    .iter()
-                    .map(|f| (f.get_full_name(), Self::from(&f.real_type)))
-                    .collect(),
-            },
-            _ => VariableInfo::String,
-        }
+// Tywaves-rs
+use tywaves_rs::tyvcd::builder::GenericBuilder;
+use tywaves_rs::tyvcd::trace_pointer::TraceFinder;
+use tywaves_rs::{hgldd, tyvcd::builder as tybuilder, tyvcd::spec as tyvcd};
+
+/// Internal state of the [TywavesTranslator]
+struct TywaveState {
+    builder: tybuilder::TyVcdBuilder<hgldd::spec::Hgldd>,
+}
+impl TywaveState {
+    // Internal function to get the tyvcd state
+    fn tyvcd(&self) -> &tyvcd::TyVcd {
+        // SAFETY: The builder is guaranteed to be initialized at this point
+        self.builder.get_ref().unwrap()
     }
 }
 
+#[inline]
+fn create_translation_result_name(variable: &tyvcd::Variable) -> String {
+    format!("{}: {}", variable.high_level_info.type_name, variable.name)
+}
+/// TywavesTranslator
 pub struct TywavesTranslator {
     state: TywaveState,
 }
 
 impl TywavesTranslator {
-    pub fn get_state(&self) -> &TywaveState {
-        &self.state
-    }
-    pub fn new(state_file: &Utf8Path) -> Result<Self> {
-        // Parse the state file using serde and initialize the TywavesTranslator
-        let state_file = std::fs::read_to_string(state_file)?;
-        let state = serde_json::from_str(&state_file)?;
+    /// Create a new TywavesTranslator.
+    ///
+    /// It parses an hgldd directory and initialize the translator by building the [tyvcd::TyVcd] IR internally.
+    ///
+    /// Returns an error if the [tyvcd::TyVcd] cannot be built.
+    pub fn new(hgldd_dir: &Utf8Path) -> Result<Self> {
+        // Parse the hgldd directory and initialize the builder and state
+        let hgldd = hgldd::reader::parse_hgldd_dir(hgldd_dir.as_ref());
+        let mut state = TywaveState {
+            builder: tybuilder::TyVcdBuilder::init(hgldd),
+        };
+        // Build the tyvcd state
+        state.builder.build();
+
+        // Check the builder for errors
+        let _ = state
+            .builder
+            .get_ref()
+            .expect("Failed to build the Tywaves state from the hgldd directory");
+
         Ok(TywavesTranslator { state })
     }
 
-    pub fn load(state_file: &Utf8Path, sender: Sender<Message>) {
-        let state_file = state_file.to_owned();
+    /// Rewrite the vcd file according to the tywaves internal state
+    pub fn vcd_rewrite(&self, vcd_path: &Path) -> Result<&str> {
+        let mut vcd_rewriter = tywaves_rs::vcd_rewrite::VcdRewriter::new(
+            vcd_path,
+            self.state.tyvcd().scopes.values().cloned().collect(),
+        );
+        vcd_rewriter
+            .rewrite()
+            .map_err(|e| eyre!("Failed to rewrite the vcd file: {:?}", e))?;
+        Ok(vcd_rewriter.get_final_file())
+    }
 
-        perform_work(move || {
-            let t = TywavesTranslator::new(&state_file);
-            match t {
-                Ok(result) => sender
-                    .send(Message::TranslatorLoaded(Box::new(result)))
-                    .unwrap(),
-                Err(e) => sender.send(Message::Error(e)).unwrap(),
+    /// Load the TywavesTranslator from an input hgldd directory
+    pub fn load(hgldd_dir_path: &Utf8Path, sender: Sender<Message>) {
+        let hgldd_dir_path = hgldd_dir_path.to_owned();
+
+        // Create a new thread to load the translator
+        perform_work(move || match TywavesTranslator::new(&hgldd_dir_path) {
+            Ok(translator) => {
+                sender
+                    .send(Message::TranslatorLoaded(Box::new(translator)))
+                    .unwrap();
+            }
+            Err(e) => {
+                sender.send(Message::Error(e)).unwrap();
             }
         });
     }
 
-    /// Given a variable meta, this explores the state and finds the variable
-    fn find_variable(&self, variable: &VariableMeta) -> Result<&symbol_table::Variable> {
-        self.state
-            .find_variable(&variable.var.full_path())
+    /// Given a variable meta, this explores the state and finds the variable.
+    /// Internal usage only.
+    fn find_variable(&self, variable: &VariableMeta) -> Result<&tyvcd::Variable> {
+        // Query the state for the trace of the variable. Find the trace by using the full path of the variable
+        let trace_getter = self
+            .state
+            .tyvcd()
+            .find_trace(&variable.var.full_path())
             .ok_or_else(|| {
                 eyre!(
                     "Variable not found in the state: {:?}",
                     variable.var.full_path()
                 )
-            })
+            })?;
+
+        // Cast the variable to tyvcd::Variable
+        let var = trace_getter
+            .as_any()
+            .downcast_ref::<tyvcd::Variable>()
+            .expect("Failed to downcast to tyvcd::Variable");
+        Ok(var)
     }
 
-    fn find_parent_variable(&self, variable: &VariableMeta) -> Result<&symbol_table::Variable> {
-        let path = variable.var.full_path();
-        self.state
-            .find_parent_variable(&path)
-            .ok_or(eyre!("Parent variable not found in the state: {:?}", path))
-    }
-
+    /// Extract the value of a subfield from a raw value.
+    /// Return the value of the subfield and the rest of the raw value.
     fn get_sub_raw_val<'a>(
         &self,
-        subfield_t: &RealType,
+        subfield_kind: &tyvcd::VariableKind,
         raw_val_vcd: &'a str,
     ) -> (&'a str, &'a str) {
         // Get size of real type
-        let size = subfield_t.find_width() as usize;
+        let size = subfield_kind.find_width() as usize;
         if raw_val_vcd.len() < size {
             return ("0", raw_val_vcd);
         }
+        // Return the value of the subfield and the rest of the raw value
         (&raw_val_vcd[..size], &raw_val_vcd[size..])
     }
 
-    fn translate_realtype(
+    /// Translate a [tyvcd::Variable] into a [TranslationResult].
+    fn translate_variable(
         &self,
-        variable: &symbol_table::Variable,
+        variable: &tyvcd::Variable,
         raw_val_vcd: &str,
     ) -> Result<TranslationResult> {
-        let real_type = &variable.real_type;
-        let val = ValueRepr::String(variable.create_val_repr(raw_val_vcd));
-        let result = match real_type {
-            symbol_table::RealType::Ground { width, .. } => {
+        // Create the value representation
+        let val_repr: ValueRepr = ValueRepr::String(variable.create_val_repr(raw_val_vcd));
+        // Create a result based on the kind of the variable
+        let result = match &variable.kind {
+            // Create a bool if the variable is a ground with width 1
+            // otherwise a bit vector
+            tyvcd::VariableKind::Ground(width) => {
                 let mut subfields = vec![];
-                for i in 0..(width.get()) as usize {
+                for i in 0..*width as usize {
                     let subfield = TranslationResult {
                         val: ValueRepr::String(raw_val_vcd.chars().nth(i).unwrap().to_string()),
                         subfields: vec![],
@@ -125,23 +157,26 @@ impl TywavesTranslator {
                     ));
                 }
 
-                let subfields = match VariableInfo::from(real_type) {
+                let subfields = match VariableInfo::from(&variable.kind) {
                     VariableInfo::Bool => vec![],
                     _ => subfields,
                 };
 
-                let kind = if subfields.len() > 1 {
-                    ValueKind::Custom(Color32::KHAKI)
-                } else {
-                    ValueKind::Normal
-                }; // TODO!: change this to use the correct value
+                // let kind = if subfields.len() > 1 {
+                //     ValueKind::Custom(Color32::KHAKI)
+                // } else {
+                //     ValueKind::Normal
+                // }; // TODO!: change this to use the correct value
+                let kind = ValueKind::Normal;
+
                 TranslationResult {
-                    val,
+                    val: val_repr,
                     subfields,
                     kind,
                 }
             }
-            symbol_table::RealType::Bundle { fields, .. } => {
+            // Create a compound value if the variable is a struct or a vector
+            tyvcd::VariableKind::Struct { fields } | tyvcd::VariableKind::Vector { fields } => {
                 // Collect the subfields of the bundle
                 let mut subfields = vec![];
 
@@ -149,36 +184,19 @@ impl TywavesTranslator {
                 let mut _val = "0";
                 for field in fields {
                     // Get the value of the subfield
-                    (_val, _raw_val_vcd) = self.get_sub_raw_val(&field.real_type, _raw_val_vcd);
+                    (_val, _raw_val_vcd) = self.get_sub_raw_val(&field.kind, _raw_val_vcd);
 
-                    // let value_repr = ValueRepr::String(field.create_val_repr(&_val));
-                    // let subfield = TranslationResult {
-                    //     val: value_repr,
-                    //     subfields: vec![],
-                    //     kind: ValueKind::Normal,
-                    // };
-                    let subfield = self.translate_realtype(field, _val)?;
                     subfields.push(super::SubFieldTranslationResult::new(
-                        field.get_full_name().clone(),
-                        subfield,
+                        create_translation_result_name(field),
+                        self.translate_variable(field, _val)?,
                     ));
                 }
                 TranslationResult {
-                    val,
+                    val: val_repr,
                     subfields,
-                    kind: ValueKind::Custom(Color32::BLUE),
+                    // kind: ValueKind::Custom(Color32::BLUE),
+                    kind: ValueKind::Normal,
                 }
-            }
-            symbol_table::RealType::Vec { .. } => {
-                // let value_repr = ValueRepr::String(raw_val_vcd.to_string());
-                // let subfields = vec![];
-                // let kind = ValueKind::Normal;
-                // TranslationResult {
-                //     val: value_repr,
-                //     subfields,
-                //     kind,
-                // }
-                todo!("Vec type not implemented")
             }
             _ => TranslationResult {
                 val: ValueRepr::String(raw_val_vcd.to_string()),
@@ -186,15 +204,14 @@ impl TywavesTranslator {
                 kind: ValueKind::Undef,
             },
         };
-        // todo!();
+
         Ok(result)
-        // Err(eyre!("Not implemented"))
     }
 }
 
 impl Translator for TywavesTranslator {
     fn name(&self) -> String {
-        "Tywaves".to_string()
+        "Tywaves translator".to_string()
     }
 
     fn translate(
@@ -203,7 +220,6 @@ impl Translator for TywavesTranslator {
         value: &VariableValue,
     ) -> Result<TranslationResult> {
         let var = self.find_variable(variable)?;
-        let _parent_var = self.find_parent_variable(variable)?;
 
         // Extract the raw value from the vcd in binary format
         let raw_val_vcd = match value {
@@ -215,31 +231,17 @@ impl Translator for TywavesTranslator {
         let raw_val_vcd = format!(
             "{:0>width$}",
             raw_val_vcd,
-            width = var.real_type.find_width() as usize
+            width = var.kind.find_width() as usize
         );
-        // let value_repr: ValueRepr = ValueRepr::String(&raw_val_vcd);
-        // let subfields = vec![];
-        // let kind = ValueKind::Normal;
-        // let result = TranslationResult {
-        //     val: value_repr,
-        //     subfields,
-        //     kind,
-        // };
 
-        let parent_var = var;
-        self.translate_realtype(&parent_var, &raw_val_vcd)
+        self.translate_variable(&var, &raw_val_vcd)
     }
 
+    // Get the variable info from the kind of the variable
     fn variable_info(&self, variable: &VariableMeta) -> Result<VariableInfo> {
         let var = self.find_variable(variable)?;
-
-        let _parent_var = self.find_parent_variable(variable)?;
-
-        let parent_var = var;
         // Convert parent var to VariableInfo
-        let parent_var_info = VariableInfo::from(&parent_var.real_type);
-
-        Ok(parent_var_info)
+        Ok(VariableInfo::from(&var.kind))
     }
 
     // Tell if the variable can be translated or not
@@ -249,6 +251,36 @@ impl Translator for TywavesTranslator {
             Ok(TranslationPreference::Prefer)
         } else {
             Ok(TranslationPreference::No)
+        }
+    }
+}
+
+// TODO: implement the conversion from tywaves types to VariableInfo
+impl From<&tyvcd::VariableKind> for VariableInfo {
+    fn from(real_type: &tyvcd::VariableKind) -> Self {
+        match real_type {
+            tyvcd::VariableKind::Ground(width) => {
+                if *width == 1 {
+                    VariableInfo::Bool
+                } else {
+                    // TODO: Change this to bits
+                    let mut subfields = vec![];
+                    for i in 0..*width {
+                        subfields.push((i.to_string(), VariableInfo::Bool));
+                    }
+                    VariableInfo::Compound { subfields }
+                }
+            }
+            tyvcd::VariableKind::Struct { fields } | tyvcd::VariableKind::Vector { fields } => {
+                VariableInfo::Compound {
+                    // TODO: Fix this
+                    subfields: fields
+                        .iter()
+                        .map(|f| (create_translation_result_name(f), Self::from(&f.kind)))
+                        .collect(),
+                }
+            }
+            _ => VariableInfo::String,
         }
     }
 }
