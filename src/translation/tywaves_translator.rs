@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, RwLock};
 
 use camino::Utf8Path;
-use eframe::egui::Color32;
 
 use crate::message::Message;
 use crate::translation::{Translator, ValueKind, ValueRepr};
@@ -44,12 +44,31 @@ impl TywavesTranslator {
     ///
     /// It parses an hgldd directory and initialize the translator by building the [tyvcd::TyVcd] IR internally.
     ///
+    /// It optionally adds `extra_scopes` at the top level of the hierarchy. If this is not wanted:
+    /// pass an empty `extra_scopes` vector if you don't want to add any extra scopes.
+    ///
+    /// ```no_run
+    /// use camino::Utf8Path;
+    /// use std::path::Path;
+    /// use tywaves_rs::translation::TywavesTranslator;
+    ///
+    /// let hgldd_dir = Utf8Path::new("path/to/hgldd");
+    /// let top_module_name = "top_module".to_string();
+    ///
+    /// let translator = TywavesTranslator::new(&hgldd_dir, Vec::new(), &top_module_name).unwrap();
+    /// ```
+    ///
     /// Returns an error if the [tyvcd::TyVcd] cannot be built.
-    pub fn new(hgldd_dir: &Utf8Path) -> Result<Self> {
+    pub fn new(
+        hgldd_dir: &Utf8Path,
+        extra_scopes: Vec<String>,
+        top_module_name: &String,
+    ) -> Result<Self> {
         // Parse the hgldd directory and initialize the builder and state
         let hgldd = hgldd::reader::parse_hgldd_dir(hgldd_dir.as_ref());
         let mut state = TywaveState {
-            builder: tybuilder::TyVcdBuilder::init(hgldd),
+            builder: tybuilder::TyVcdBuilder::init(hgldd)
+                .with_extra_artifact_scopes(extra_scopes, top_module_name),
         };
         // Build the tyvcd state
         state.builder.build();
@@ -58,61 +77,67 @@ impl TywavesTranslator {
         let _ = state
             .builder
             .get_ref()
-            .expect("Failed to build the Tywaves state from the hgldd directory");
+            .ok_or_else(|| eyre!("Failed to build the Tywaves state from the hgldd directory"))?;
 
         Ok(TywavesTranslator { state })
     }
 
     /// Rewrite the vcd file according to the tywaves internal state
     pub fn vcd_rewrite(&self, vcd_path: &Path) -> Result<&str> {
-        let mut vcd_rewriter = tywaves_rs::vcd_rewrite::VcdRewriter::new(
-            vcd_path,
-            self.state.tyvcd().scopes.values().cloned().collect(),
-        );
-        vcd_rewriter
-            .rewrite()
-            .map_err(|e| eyre!("Failed to rewrite the vcd file: {:?}", e))?;
+        let tywaves_scopes = &self.state.tyvcd().scopes;
+        // Get the list of scopes
+        let scopes_def_list = tywaves_scopes
+            .into_iter()
+            .map(|(_, v)| (v.read().unwrap().clone()))
+            .collect();
+
+        let mut vcd_rewriter = tywaves_rs::vcd_rewrite::VcdRewriter::new(vcd_path, scopes_def_list);
+        vcd_rewriter.rewrite()?;
         Ok(vcd_rewriter.get_final_file())
     }
 
-    /// Load the TywavesTranslator from an input hgldd directory
-    pub fn load(hgldd_dir_path: &Utf8Path, sender: Sender<Message>) {
+    /// Load the TywavesTranslator from an input hgldd directory (optionally
+    /// adding `extra_scopes` at the top level of the hierarchy).
+    ///
+    /// Pass empty `extra_scopes` if you don't want to add any extra scopes.
+    pub fn load(
+        hgldd_dir_path: &Utf8Path,
+        sender: Sender<Message>,
+        extra_scopes: Vec<String>,
+        top_module_name: String,
+    ) {
         let hgldd_dir_path = hgldd_dir_path.to_owned();
 
         // Create a new thread to load the translator
-        perform_work(move || match TywavesTranslator::new(&hgldd_dir_path) {
-            Ok(translator) => {
-                sender
+        perform_work(move || {
+            match TywavesTranslator::new(&hgldd_dir_path, extra_scopes, &top_module_name) {
+                Ok(translator) => sender
                     .send(Message::TranslatorLoaded(Box::new(translator)))
-                    .unwrap();
-            }
-            Err(e) => {
-                sender.send(Message::Error(e)).unwrap();
+                    .unwrap(),
+                Err(e) => sender.send(Message::Error(e)).unwrap(),
             }
         });
     }
 
     /// Given a variable meta, this explores the state and finds the variable.
     /// Internal usage only.
-    fn find_variable(&self, variable: &VariableMeta) -> Result<&tyvcd::Variable> {
+    fn find_variable(&self, variable: &VariableMeta) -> Result<Arc<RwLock<tyvcd::Variable>>> {
+        let var_full_path = variable.var.full_path();
         // Query the state for the trace of the variable. Find the trace by using the full path of the variable
         let trace_getter = self
             .state
             .tyvcd()
-            .find_trace(&variable.var.full_path())
-            .ok_or_else(|| {
-                eyre!(
-                    "Variable not found in the state: {:?}",
-                    variable.var.full_path()
-                )
-            })?;
+            .find_trace(&var_full_path)
+            .ok_or_else(|| eyre!("Variable not found in the state: {:?}", var_full_path))?;
 
-        // Cast the variable to tyvcd::Variable
-        let var = trace_getter
+        // Try to cast the variable to tyvcd::Variable
+        let binding = trace_getter.read().unwrap();
+        let var = binding
             .as_any()
             .downcast_ref::<tyvcd::Variable>()
-            .expect("Failed to downcast to tyvcd::Variable");
-        Ok(var)
+            .ok_or_else(|| eyre!("Failed to downcast {:?} to tyvcd::Variable", var_full_path))?;
+
+        Ok(Arc::new(RwLock::new(var.clone())))
     }
 
     /// Extract the value of a subfield from a raw value.
@@ -220,6 +245,7 @@ impl Translator for TywavesTranslator {
         value: &VariableValue,
     ) -> Result<TranslationResult> {
         let var = self.find_variable(variable)?;
+        let var = var.read().unwrap();
 
         // Extract the raw value from the vcd in binary format
         let raw_val_vcd = match value {
@@ -240,8 +266,9 @@ impl Translator for TywavesTranslator {
     // Get the variable info from the kind of the variable
     fn variable_info(&self, variable: &VariableMeta) -> Result<VariableInfo> {
         let var = self.find_variable(variable)?;
+        let kind = &var.read().unwrap().kind;
         // Convert parent var to VariableInfo
-        Ok(VariableInfo::from(&var.kind))
+        Ok(VariableInfo::from(kind))
     }
 
     // Tell if the variable can be translated or not
@@ -252,6 +279,10 @@ impl Translator for TywavesTranslator {
         } else {
             Ok(TranslationPreference::No)
         }
+    }
+
+    fn reload(&self, _sender: Sender<Message>) {
+        // TODO: Implement reload for tywaves translator
     }
 }
 

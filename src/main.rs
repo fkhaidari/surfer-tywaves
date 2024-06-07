@@ -125,6 +125,22 @@ struct Args {
     /// will be added.
     #[clap(long, verbatim_doc_comment)]
     hgldd_dir: Option<Utf8PathBuf>,
+    /// Extra scopes that links the hgldd_dir to the wave_file. They can be more than one. 
+    /// This option should be used when the wave file contains some "extra scopes" that are 
+    /// parents of the top module (specified with --top-module) and are present in the 
+    /// WAVE-FILE hierarchy but not in the hgldd files. 
+    /// This typically happens when simulation frameworks create artifacts for their APIs.
+    /// 
+    /// The last name in the list will replace the --top-module name in the hierarchy.
+    /// 
+    /// NOTE: it must be used with --hgldd-dir and --top-module.
+    #[clap(long, requires("hgldd_dir"), requires("top_module"),  num_args(1..), verbatim_doc_comment)]
+    extra_scopes: Vec<String>,
+    /// Top module name to use when loading extra scopes. It will be replaced by the last extra scope.
+    /// 
+    /// NOTE: it must be used with --hgldd-dir and --extra-scopes.
+    #[clap(long, requires("extra_scopes"))]
+    top_module: Option<String>,
 
     /// Path to a file containing 'commands' to run after a waveform has been loaded.
     /// The commands are the same as those used in the command line interface inside the program.
@@ -160,6 +176,8 @@ struct StartupParams {
     pub spade_state: Option<Utf8PathBuf>,
     pub spade_top: Option<String>,
     pub hgldd_dir: Option<Utf8PathBuf>,
+    pub extra_scopes: Vec<String>,
+    pub top_module_name: String,
     pub waves: Option<WaveSource>,
     pub startup_commands: Vec<String>,
 }
@@ -171,6 +189,8 @@ impl StartupParams {
             spade_state: None,
             spade_top: None,
             hgldd_dir: None,
+            extra_scopes: vec![],
+            top_module_name: String::new(),
             waves: None,
             startup_commands: vec![],
         }
@@ -182,6 +202,8 @@ impl StartupParams {
             spade_state: None,
             spade_top: None,
             hgldd_dir: None,
+            extra_scopes: vec![],
+            top_module_name: String::new(),
             waves: url.load_url.map(WaveSource::Url),
             startup_commands: url.startup_commands.map(|c| vec![c]).unwrap_or_default(),
         }
@@ -202,6 +224,12 @@ impl StartupParams {
             spade_state: args.spade_state,
             spade_top: args.spade_top,
             hgldd_dir: args.hgldd_dir,
+            extra_scopes: args.extra_scopes,
+            top_module_name: if let Some(s) = args.top_module {
+                s
+            } else {
+                String::new()
+            },
             waves: args.wave_file.map(|s| string_to_wavesource(&s)),
             startup_commands,
         }
@@ -579,7 +607,10 @@ impl State {
         self.waves = None;
 
         let hgldd_dir = args.hgldd_dir.clone(); // Copy for the closure
-                                                // Long running translators which we load in a thread
+        let extra_scopes = args.extra_scopes.clone();
+        let top_module_name = args.top_module_name.clone();
+
+        // Long running translators which we load in a thread
         {
             #[cfg(feature = "spade")]
             let sender = self.sys.channels.msg_sender.clone();
@@ -591,7 +622,12 @@ impl State {
                 if let (Some(top), Some(state)) = (args.spade_top, args.spade_state) {
                     SpadeTranslator::load(&top, &state, sender);
                 } else if let Some(hgldd_dir) = args.hgldd_dir {
-                    TywavesTranslator::load(&hgldd_dir, sender);
+                    TywavesTranslator::load(
+                        &hgldd_dir,
+                        sender,
+                        args.extra_scopes,
+                        args.top_module_name,
+                    );
                 } else {
                     info!("spade-top and spade-state not set, not loading spade translator");
                 }
@@ -606,8 +642,12 @@ impl State {
             Some(WaveSource::Url(url)) => self.load_vcd_from_url(url, LoadOptions::clean()),
             Some(WaveSource::File(wave_file)) => {
                 let file = if let Some(hgldd_dir) = hgldd_dir {
-                    let tywaves_translator = tywaves_translator::TywavesTranslator::new(&hgldd_dir)
-                        .expect("failed to load tywaves translator");
+                    let tywaves_translator = tywaves_translator::TywavesTranslator::new(
+                        &hgldd_dir,
+                        extra_scopes,
+                        &top_module_name,
+                    )
+                    .expect("failed to load tywaves translator");
 
                     // Rewrite the vcd file -> the new wave source
                     let file = tywaves_translator
