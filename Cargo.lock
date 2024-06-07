@@ -1839,15 +1839,14 @@ dependencies = [
 
 [[package]]
 name = "fst-native"
-version = "0.8.0"
+version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "719bcce3b663b5b707b9d67788d0b14753e6300febbaac1a5db09728fcb6ccce"
+checksum = "f679eeba3125f4284323433b37379532e42d6d5f5e1565ea1184526f6b5adb8f"
 dependencies = [
  "flate2",
  "lz4_flex",
  "num_enum",
  "tempfile",
- "thiserror",
 ]
 
 [[package]]
@@ -4376,8 +4375,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81cdd64d312baedb58e21336b31bc043b77e01cc99033ce76ef539f78e965ebc"
 
 [[package]]
-name = "surfer"
-version = "0.2.0-dev"
+name = "surfer-tywaves"
+version = "0.2.0-tywaves-dev"
 dependencies = [
  "asm_riscv",
  "base64 0.22.0",
@@ -4438,6 +4437,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing-wasm",
+ "tywaves",
  "vcd-translate",
  "vergen",
  "wasm-bindgen",
@@ -4917,6 +4917,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42ff0bf0c66b8238c6f3b578df37d0b7848e55df8577b3f74f92a69acceeb825"
 
 [[package]]
+name = "tywaves"
+version = "0.1.0"
+dependencies = [
+ "eyre",
+ "serde",
+ "serde_json",
+ "serde_stacker",
+ "vcd 0.7.0",
+]
+
+[[package]]
 name = "uds_windows"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5029,6 +5040,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84a5ed196124bf3bb32418e5f79cd7548a455500bba37e094f7ef4cfe91161fc"
 
 [[package]]
+name = "vcd"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4505774fc84de82eb04caa74d859342b0daa376f4c6df45149593245dd62c004"
+
+[[package]]
 name = "vcd-translate"
 version = "0.1.0"
 dependencies = [
@@ -5044,7 +5061,7 @@ dependencies = [
  "spade-mir",
  "spade-typeinference",
  "spade-types",
- "vcd",
+ "vcd 0.6.1",
 ]
 
 [[package]]
@@ -5352,7 +5369,7 @@ dependencies = [
 
 [[package]]
 name = "wellen"
-version = "0.8.11"
+version = "0.8.9"
 dependencies = [
  "bytesize",
  "fst-native",

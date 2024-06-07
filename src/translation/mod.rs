@@ -8,6 +8,7 @@ pub mod clock;
 mod enum_translator;
 pub mod numeric_translators;
 pub mod spade;
+pub mod tywaves_translator;
 
 pub use basic_translators::*;
 use itertools::Itertools;
@@ -117,7 +118,7 @@ impl TranslatorList {
     }
 }
 
-#[derive(Clone, PartialEq, Copy)]
+#[derive(Clone, PartialEq, Copy, Debug)]
 pub enum ValueKind {
     Normal,
     Undef,
@@ -130,7 +131,7 @@ pub enum ValueKind {
 
 /// The representation of the value, compound values can be
 /// be represented by the repr of their subfields
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ValueRepr {
     Bit(char),
     /// The value is `.0` raw bits, and can be translated by further translators
@@ -155,7 +156,7 @@ pub enum ValueRepr {
     NotPresent,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct TranslatedValue {
     pub value: String,
     pub kind: ValueKind,
@@ -177,7 +178,7 @@ impl TranslatedValue {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SubFieldFlatTranslationResult {
     pub names: Vec<String>,
     pub value: Option<TranslatedValue>,

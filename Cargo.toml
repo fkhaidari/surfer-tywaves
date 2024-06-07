@@ -1,6 +1,6 @@
 [package]
-name = "surfer"
-version = "0.2.0-dev"
+name = "surfer-tywaves"
+version = "0.2.0-tywaves-dev"
 edition = "2021"
 license = "EUPL-1.2"
 categories = ["development-tools::debugging", "science"]
@@ -59,6 +59,8 @@ toml = "0.8.8"
 vcd-translate = { path = "spade/vcd-translate", optional = true }
 web-sys = { version = "0.3.66", features = ["Location", "UrlSearchParams"] }
 wellen = { path = "wellen" }
+
+tywaves = { path = "tywaves" }
 
 [features]
 default = ["spade", "performance_plot"]

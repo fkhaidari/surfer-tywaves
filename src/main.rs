@@ -76,6 +76,8 @@ use serde::Serialize;
 use time::TimeStringFormatting;
 use time::TimeUnit;
 use translation::all_translators;
+use translation::tywaves_translator::TywavesTranslator;
+
 #[cfg(feature = "spade")]
 use translation::spade::SpadeTranslator;
 use translation::TranslatorList;
@@ -98,6 +100,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -114,6 +117,10 @@ struct Args {
     spade_state: Option<Utf8PathBuf>,
     #[clap(long)]
     spade_top: Option<String>,
+
+    #[clap(long)]
+    chisel_state: Option<Utf8PathBuf>,
+
     /// Path to a file containing 'commands' to run after a waveform has been loaded.
     /// The commands are the same as those used in the command line interface inside the program.
     /// Commands are separated by lines or ;. Empty lines are ignored. Line comments starting with
@@ -147,6 +154,7 @@ impl Args {
 struct StartupParams {
     pub spade_state: Option<Utf8PathBuf>,
     pub spade_top: Option<String>,
+    pub chisel_state: Option<Utf8PathBuf>,
     pub waves: Option<WaveSource>,
     pub startup_commands: Vec<String>,
 }
@@ -157,6 +165,7 @@ impl StartupParams {
         Self {
             spade_state: None,
             spade_top: None,
+            chisel_state: None,
             waves: None,
             startup_commands: vec![],
         }
@@ -167,6 +176,7 @@ impl StartupParams {
         Self {
             spade_state: None,
             spade_top: None,
+            chisel_state: None,
             waves: url.load_url.map(WaveSource::Url),
             startup_commands: url.startup_commands.map(|c| vec![c]).unwrap_or_default(),
         }
@@ -186,6 +196,7 @@ impl StartupParams {
         Self {
             spade_state: args.spade_state,
             spade_top: args.spade_top,
+            chisel_state: args.chisel_state,
             waves: args.wave_file.map(|s| string_to_wavesource(&s)),
             startup_commands,
         }
@@ -269,7 +280,7 @@ fn main() -> Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Surfer")
+            .with_title("Surfer-tywaves demo")
             .with_inner_size(egui::Vec2::new(
                 state.config.layout.window_width as f32,
                 state.config.layout.window_height as f32,
@@ -278,7 +289,7 @@ fn main() -> Result<()> {
     };
 
     eframe::run_native(
-        "Surfer",
+        "Surfer-tywaves demo",
         options,
         Box::new(|cc| {
             let ctx_arc = Arc::new(cc.egui_ctx.clone());
@@ -364,6 +375,7 @@ struct Channels {
     msg_sender: Sender<Message>,
     msg_receiver: Receiver<Message>,
 }
+
 impl Channels {
     fn new() -> Self {
         let (msg_sender, msg_receiver) = mpsc::channel();
@@ -561,6 +573,7 @@ impl State {
         self.previous_waves = self.waves;
         self.waves = None;
 
+        let chisel_state = args.chisel_state.clone();
         // Long running translators which we load in a thread
         {
             #[cfg(feature = "spade")]
@@ -569,8 +582,11 @@ impl State {
             let _ = self.sys.channels.msg_sender.clone();
             perform_work(move || {
                 #[cfg(feature = "spade")]
+                // Here the spade is given
                 if let (Some(top), Some(state)) = (args.spade_top, args.spade_state) {
                     SpadeTranslator::load(&top, &state, sender);
+                } else if let Some(chisel_state) = args.chisel_state {
+                    TywavesTranslator::load(&chisel_state, sender);
                 } else {
                     info!("spade-top and spade-state not set, not loading spade translator");
                 }
@@ -583,9 +599,19 @@ impl State {
 
         match args.waves {
             Some(WaveSource::Url(url)) => self.load_vcd_from_url(url, LoadOptions::clean()),
-            Some(WaveSource::File(file)) => self
-                .load_wave_from_file(file, LoadOptions::clean())
-                .unwrap(),
+            Some(WaveSource::File(file)) => {
+                let file = if let Some(chisel_state) = chisel_state {
+                    let translator = TywavesTranslator::new(&chisel_state).unwrap();
+                    let file = translator
+                        .get_state()
+                        .vcd_rewrite_surfer(file.as_std_path());
+                    Utf8PathBuf::from_path_buf(PathBuf::from(file)).unwrap()
+                } else {
+                    file
+                };
+                self.load_wave_from_file(file, LoadOptions::clean())
+                    .unwrap()
+            }
             Some(WaveSource::Data) => error!("Attempted to load data at startup"),
             #[cfg(not(target_arch = "wasm32"))]
             Some(WaveSource::CxxrtlTcp(url)) => {
@@ -1088,7 +1114,9 @@ impl State {
                 }
             }
             Message::ReloadWaveform(keep_unavailable) => {
-                let Some(waves) = &self.waves else { return };
+                let Some(waves) = &self.waves else {
+                    return;
+                };
                 match &waves.source {
                     WaveSource::File(filename) => {
                         self.load_wave_from_file(
