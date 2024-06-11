@@ -15,7 +15,7 @@ use color_eyre::{eyre::eyre, Result}; // Add this line
 
 // Tywaves-rs
 use tywaves_rs::tyvcd::builder::GenericBuilder;
-use tywaves_rs::tyvcd::trace_pointer::TraceFinder;
+use tywaves_rs::tyvcd::trace_pointer::{TraceFinder, TraceGetter};
 use tywaves_rs::{hgldd, tyvcd::builder as tybuilder, tyvcd::spec as tyvcd};
 
 /// Internal state of the [TywavesTranslator]
@@ -32,6 +32,12 @@ impl TywaveState {
 
 #[inline]
 fn create_translation_result_name(variable: &tyvcd::Variable) -> String {
+    // format!(
+    //     "{:?}\n{}: {}",
+    //     variable.get_trace_value(),
+    //     variable.high_level_info.type_name,
+    //     variable.name
+    // )
     format!("{}: {}", variable.high_level_info.type_name, variable.name)
 }
 /// TywavesTranslator
@@ -65,19 +71,24 @@ impl TywavesTranslator {
         top_module_name: &String,
     ) -> Result<Self> {
         // Parse the hgldd directory and initialize the builder and state
-        let hgldd = hgldd::reader::parse_hgldd_dir(hgldd_dir.as_ref());
+        let hgldd = hgldd::reader::parse_hgldd_dir(hgldd_dir.as_ref()).map_err(|e| {
+            eyre!(
+                "Failed to parse the hgldd directory: {:?}.\nError: {:?}",
+                hgldd_dir,
+                e
+            )
+        })?;
         let mut state = TywaveState {
             builder: tybuilder::TyVcdBuilder::init(hgldd)
                 .with_extra_artifact_scopes(extra_scopes, top_module_name),
         };
         // Build the tyvcd state
-        state.builder.build();
-
-        // Check the builder for errors
-        let _ = state
-            .builder
-            .get_ref()
-            .ok_or_else(|| eyre!("Failed to build the Tywaves state from the hgldd directory"))?;
+        state.builder.build().map_err(|e| {
+            eyre!(
+                "Failed to build the Tywaves state from the hgldd directory.\nError: {:?}",
+                e
+            )
+        })?;
 
         Ok(TywavesTranslator { state })
     }
@@ -91,8 +102,11 @@ impl TywavesTranslator {
             .map(|(_, v)| (v.read().unwrap().clone()))
             .collect();
 
-        let mut vcd_rewriter = tywaves_rs::vcd_rewrite::VcdRewriter::new(vcd_path, scopes_def_list);
-        vcd_rewriter.rewrite()?;
+        let mut vcd_rewriter = tywaves_rs::vcd_rewrite::VcdRewriter::new(vcd_path, scopes_def_list)
+            .map_err(|e| eyre!("Failed to rewrite the vcd file.\nError: {:?}", e))?;
+        vcd_rewriter
+            .rewrite()
+            .map_err(|e| eyre!("Failed to rewrite the vcd file.\nError: {:?}", e))?;
         Ok(vcd_rewriter.get_final_file())
     }
 
