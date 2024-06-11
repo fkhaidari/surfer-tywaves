@@ -125,19 +125,19 @@ struct Args {
     /// will be added.
     #[clap(long, verbatim_doc_comment)]
     hgldd_dir: Option<Utf8PathBuf>,
-    /// Extra scopes that links the hgldd_dir to the wave_file. They can be more than one. 
-    /// This option should be used when the wave file contains some "extra scopes" that are 
-    /// parents of the top module (specified with --top-module) and are present in the 
-    /// WAVE-FILE hierarchy but not in the hgldd files. 
+    /// Extra scopes that links the hgldd_dir to the wave_file. They can be more than one.
+    /// This option should be used when the wave file contains some "extra scopes" that are
+    /// parents of the top module (specified with --top-module) and are present in the
+    /// WAVE-FILE hierarchy but not in the hgldd files.
     /// This typically happens when simulation frameworks create artifacts for their APIs.
-    /// 
+    ///
     /// The last name in the list will replace the --top-module name in the hierarchy.
-    /// 
+    ///
     /// NOTE: it must be used with --hgldd-dir and --top-module.
     #[clap(long, requires("hgldd_dir"), requires("top_module"),  num_args(1..), verbatim_doc_comment)]
     extra_scopes: Vec<String>,
     /// Top module name to use when loading extra scopes. It will be replaced by the last extra scope.
-    /// 
+    ///
     /// NOTE: it must be used with --hgldd-dir and --extra-scopes.
     #[clap(long, requires("extra_scopes"))]
     top_module: Option<String>,
