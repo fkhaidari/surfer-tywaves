@@ -11,7 +11,47 @@ use crate::{
 
 const DEFAULT_DIVIDER_NAME: &str = "";
 
-pub type DisplayedItemRef = usize;
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct DisplayedItemRef(pub usize);
+
+impl From<usize> for DisplayedItemRef {
+    fn from(item: usize) -> Self {
+        DisplayedItemRef(item)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Hash)]
+pub struct DisplayedFieldRef {
+    pub item: DisplayedItemRef,
+    pub field: Vec<String>,
+}
+
+impl DisplayedFieldRef {
+    pub fn without_field(&self) -> DisplayedFieldRef {
+        DisplayedFieldRef {
+            item: self.item,
+            field: vec![],
+        }
+    }
+}
+
+impl From<DisplayedItemRef> for DisplayedFieldRef {
+    fn from(item: DisplayedItemRef) -> Self {
+        DisplayedFieldRef {
+            item,
+            field: vec![],
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct DisplayedItemIndex(pub usize);
+
+impl From<usize> for DisplayedItemIndex {
+    fn from(index: usize) -> Self {
+        DisplayedItemIndex(index)
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum DisplayedItem {
@@ -20,6 +60,12 @@ pub enum DisplayedItem {
     Marker(DisplayedMarker),
     TimeLine(DisplayedTimeLine),
     Placeholder(DisplayedPlaceholder),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct FieldFormat {
+    pub field: Vec<String>,
+    pub format: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -32,9 +78,22 @@ pub struct DisplayedVariable {
     pub display_name: String,
     pub display_name_type: VariableNameType,
     pub manual_name: Option<String>,
+    pub format: Option<String>,
+    pub field_formats: Vec<FieldFormat>,
 }
 
 impl DisplayedVariable {
+    pub fn get_format(&self, field: &[String]) -> Option<&String> {
+        if field.is_empty() {
+            self.format.as_ref()
+        } else {
+            self.field_formats
+                .iter()
+                .find(|ff| ff.field == field)
+                .map(|ff| &ff.format)
+        }
+    }
+
     /// Updates the variable after a new waveform has been loaded.
     pub fn update(
         &self,
@@ -45,7 +104,7 @@ impl DisplayedVariable {
             // variable is not available in the new waveform
             None => {
                 if keep_unavailable {
-                    Some(DisplayedItem::Placeholder(self.clone().to_placeholder()))
+                    Some(DisplayedItem::Placeholder(self.clone().into_placeholder()))
                 } else {
                     None
                 }
@@ -58,7 +117,7 @@ impl DisplayedVariable {
         }
     }
 
-    pub fn to_placeholder(mut self) -> DisplayedPlaceholder {
+    pub fn into_placeholder(mut self) -> DisplayedPlaceholder {
         self.variable_ref.clear_id(); // placeholders do not refer to currently loaded variables
         DisplayedPlaceholder {
             variable_ref: self.variable_ref,
@@ -67,6 +126,8 @@ impl DisplayedVariable {
             display_name: self.display_name,
             display_name_type: self.display_name_type,
             manual_name: self.manual_name,
+            format: self.format,
+            field_formats: self.field_formats,
         }
     }
 }
@@ -126,10 +187,12 @@ pub struct DisplayedPlaceholder {
     pub display_name: String,
     pub display_name_type: VariableNameType,
     pub manual_name: Option<String>,
+    pub format: Option<String>,
+    pub field_formats: Vec<FieldFormat>,
 }
 
 impl DisplayedPlaceholder {
-    pub fn to_variable(
+    pub fn into_variable(
         self,
         variable_info: VariableInfo,
         updated_variable_ref: VariableRef,
@@ -142,6 +205,8 @@ impl DisplayedPlaceholder {
             display_name: self.display_name,
             display_name_type: self.display_name_type,
             manual_name: self.manual_name,
+            format: self.format,
+            field_formats: self.field_formats,
         }
     }
 }
@@ -159,13 +224,11 @@ impl DisplayedItem {
 
     pub fn set_color(&mut self, color_name: Option<String>) {
         match self {
-            DisplayedItem::Variable(variable) => variable.color = color_name.clone(),
-            DisplayedItem::Divider(divider) => divider.color = color_name.clone(),
-            DisplayedItem::Marker(marker) => marker.color = color_name.clone(),
-            DisplayedItem::TimeLine(timeline) => {
-                timeline.color = color_name.clone();
-            }
-            DisplayedItem::Placeholder(placeholder) => placeholder.color = color_name.clone(),
+            DisplayedItem::Variable(variable) => variable.color.clone_from(&color_name),
+            DisplayedItem::Divider(divider) => divider.color.clone_from(&color_name),
+            DisplayedItem::Marker(marker) => marker.color.clone_from(&color_name),
+            DisplayedItem::TimeLine(timeline) => timeline.color.clone_from(&color_name),
+            DisplayedItem::Placeholder(placeholder) => placeholder.color.clone_from(&color_name),
         }
     }
 
@@ -196,18 +259,15 @@ impl DisplayedItem {
     }
 
     /// Widget displayed in variable list for the wave form, may include additional info compared to name()
-    pub fn add_to_layout_job(
-        &self,
-        color: &Color32,
-        index: Option<String>,
-        style: &Style,
-        layout_job: &mut LayoutJob,
-    ) {
+    pub fn add_to_layout_job(&self, color: &Color32, style: &Style, layout_job: &mut LayoutJob) {
         match self {
             DisplayedItem::Variable(_) => {
-                RichText::new(format!("{}{}", self.name(), index.unwrap_or_default()))
-                    .color(*color)
-                    .append_to(layout_job, style, FontSelection::Default, Align::Center);
+                RichText::new(self.name()).color(*color).append_to(
+                    layout_job,
+                    style,
+                    FontSelection::Default,
+                    Align::Center,
+                );
             }
             DisplayedItem::TimeLine(_) | DisplayedItem::Divider(_) => {
                 RichText::new(self.name())
@@ -265,25 +325,30 @@ impl DisplayedItem {
     pub fn set_background_color(&mut self, color_name: Option<String>) {
         match self {
             DisplayedItem::Variable(variable) => {
-                variable.background_color = color_name.clone();
+                variable.background_color.clone_from(&color_name);
             }
             DisplayedItem::Divider(divider) => {
-                divider.background_color = color_name.clone();
+                divider.background_color.clone_from(&color_name);
             }
             DisplayedItem::Marker(marker) => {
-                marker.background_color = color_name.clone();
+                marker.background_color.clone_from(&color_name);
             }
             DisplayedItem::TimeLine(timeline) => {
-                timeline.background_color = color_name.clone();
+                timeline.background_color.clone_from(&color_name);
             }
             DisplayedItem::Placeholder(placeholder) => {
-                placeholder.background_color = color_name.clone();
+                placeholder.background_color.clone_from(&color_name);
             }
         }
     }
 }
 
-pub fn draw_rename_window(ctx: &Context, msgs: &mut Vec<Message>, idx: usize, name: &mut String) {
+pub fn draw_rename_window(
+    ctx: &Context,
+    msgs: &mut Vec<Message>,
+    idx: DisplayedItemIndex,
+    name: &mut String,
+) {
     let mut open = true;
     Window::new("Rename item")
         .open(&mut open)

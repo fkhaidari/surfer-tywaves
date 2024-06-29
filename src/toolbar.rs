@@ -1,6 +1,5 @@
 use eframe::egui::{Button, Context, Layout, RichText, TopBottomPanel, Ui};
-use eframe::emath::Align;
-use eframe::epaint::Vec2;
+use eframe::emath::{Align, Vec2};
 use egui_remixicon::icons;
 
 use crate::wave_container::SimulationStatus;
@@ -67,6 +66,8 @@ impl State {
 
     fn draw_toolbar(&self, ui: &mut Ui, msgs: &mut Vec<Message>) {
         let wave_loaded = self.waves.is_some();
+        let undo_available = !self.sys.undo_stack.is_empty();
+        let redo_available = !self.sys.redo_stack.is_empty();
         let item_selected = wave_loaded && self.waves.as_ref().unwrap().focused_item.is_some();
         let cursor_set = wave_loaded && self.waves.as_ref().unwrap().cursor.is_some();
         let multiple_viewports = wave_loaded && (self.waves.as_ref().unwrap().viewports.len() > 1);
@@ -142,7 +143,7 @@ impl State {
             add_toolbar_button(
                 ui,
                 msgs,
-                "⛶",
+                icons::ASPECT_RATIO_FILL,
                 "Zoom to fit",
                 Message::ZoomToFit { viewport_idx: 0 },
                 wave_loaded,
@@ -229,7 +230,7 @@ impl State {
                 ui,
                 msgs,
                 icons::CONTRACT_LEFT_FILL,
-                "Set cursor on previous transition of focused signal",
+                "Set cursor on previous transition of focused variable",
                 Message::MoveCursorToTransition {
                     next: false,
                     variable: None,
@@ -241,7 +242,7 @@ impl State {
                 ui,
                 msgs,
                 icons::CONTRACT_RIGHT_FILL,
-                "Set cursor on next transition of focused signal",
+                "Set cursor on next transition of focused variable",
                 Message::MoveCursorToTransition {
                     next: true,
                     variable: None,
@@ -286,6 +287,33 @@ impl State {
                 "Remove viewport",
                 Message::RemoveViewport,
                 wave_loaded && multiple_viewports,
+            );
+
+            let undo_tooltip = if let Some(undo_op) = self.sys.undo_stack.last() {
+                format!("Undo: {}", undo_op.message)
+            } else {
+                "Undo".into()
+            };
+            let redo_tooltip = if let Some(redo_op) = self.sys.redo_stack.last() {
+                format!("Redo: {}", redo_op.message)
+            } else {
+                "Redo".into()
+            };
+            add_toolbar_button(
+                ui,
+                msgs,
+                icons::ARROW_GO_BACK_FILL,
+                &undo_tooltip,
+                Message::Undo(1),
+                undo_available,
+            );
+            add_toolbar_button(
+                ui,
+                msgs,
+                icons::ARROW_GO_FORWARD_FILL,
+                &redo_tooltip,
+                Message::Redo(1),
+                redo_available,
             );
 
             self.simulation_status_toolbar(ui, msgs);

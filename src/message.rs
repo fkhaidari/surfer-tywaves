@@ -1,57 +1,77 @@
-use std::path::PathBuf;
-
 use bytes::Bytes;
 use camino::Utf8PathBuf;
 use derivative::Derivative;
 use eframe::{
     egui::DroppedFile,
-    epaint::{Pos2, Vec2},
+    emath::{Pos2, Vec2},
 };
 use num::BigInt;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 use crate::{
     clock_highlighting::ClockHighlightType,
     config::ArrowKeyBindings,
+    displayed_item::DisplayedFieldRef,
+    displayed_item::DisplayedItemIndex,
     time::{TimeStringFormatting, TimeUnit},
     translation::Translator,
     variable_name_type::VariableNameType,
-    wave_container::{FieldRef, ScopeRef, VariableRef, WaveContainer},
+    wave_container::{ScopeRef, VariableRef, WaveContainer},
     wave_source::{LoadOptions, OpenMode},
+    wellen::LoadSignalsResult,
     MoveDir, VariableNameFilterType, WaveSource,
 };
 use crate::{config::HierarchyStyle, wave_source::WaveFormat};
 
 type CommandCount = usize;
 
+pub enum HeaderResult {
+    /// result of locally parsing the header of a waveform file with wellen
+    Local(Box<wellen::viewers::HeaderResult>),
+    /// result of querying a remote surfer server
+    Remote(
+        std::sync::Arc<wellen::Hierarchy>,
+        wellen::FileFormat,
+        String,
+    ),
+}
+
+pub enum BodyResult {
+    /// result of locally parsing the body of a waveform file with wellen
+    Local(wellen::viewers::BodyResult),
+    /// result of querying a remote surfer server
+    Remote(Vec<wellen::Time>, String),
+}
+
 #[derive(Derivative, Deserialize)]
 #[derivative(Debug)]
 pub enum Message {
     SetActiveScope(ScopeRef),
-    AddVariable(VariableRef),
+    AddVariables(Vec<VariableRef>),
     AddScope(ScopeRef),
     AddCount(char),
     InvalidateCount,
-    RemoveItem(usize, CommandCount),
-    FocusItem(usize),
+    RemoveItem(DisplayedItemIndex, CommandCount),
+    FocusItem(DisplayedItemIndex),
     UnfocusItem,
-    RenameItem(Option<usize>),
+    RenameItem(Option<DisplayedItemIndex>),
     MoveFocus(MoveDir, CommandCount),
     MoveFocusedItem(MoveDir, CommandCount),
     VerticalScroll(MoveDir, CommandCount),
     ScrollToItem(usize),
     SetScrollOffset(f32),
-    VariableFormatChange(FieldRef, String),
-    ItemColorChange(Option<usize>, Option<String>),
-    ItemBackgroundColorChange(Option<usize>, Option<String>),
-    ItemNameChange(Option<usize>, Option<String>),
-    ChangeVariableNameType(Option<usize>, VariableNameType),
+    VariableFormatChange(DisplayedFieldRef, String),
+    ItemColorChange(Option<DisplayedItemIndex>, Option<String>),
+    ItemBackgroundColorChange(Option<DisplayedItemIndex>, Option<String>),
+    ItemNameChange(Option<DisplayedItemIndex>, Option<String>),
+    ChangeVariableNameType(Option<DisplayedItemIndex>, VariableNameType),
     ForceVariableNameTypes(VariableNameType),
     SetNameAlignRight(bool),
     SetClockHighlightType(ClockHighlightType),
     // Reset the translator for this variable back to default. Sub-variables,
     // i.e. those with the variable idx and a shared path are also reset
-    ResetVariableFormat(FieldRef),
+    ResetVariableFormat(DisplayedFieldRef),
     CanvasScroll {
         delta: Vec2,
         viewport_idx: usize,
@@ -68,17 +88,37 @@ pub enum Message {
     },
     CursorSet(BigInt),
     RightCursorSet(Option<BigInt>),
+    #[serde(skip)]
+    SurferServerStatus(web_time::Instant, String, crate::remote::Status),
     LoadWaveformFile(Utf8PathBuf, LoadOptions),
     LoadWaveformFileFromUrl(String, LoadOptions),
     LoadWaveformFileFromData(Vec<u8>, LoadOptions),
     #[cfg(not(target_arch = "wasm32"))]
     ConnectToCxxrtl(String),
     #[serde(skip)]
+    WaveHeaderLoaded(
+        web_time::Instant,
+        WaveSource,
+        LoadOptions,
+        #[derivative(Debug = "ignore")] HeaderResult,
+    ),
+    #[serde(skip)]
+    WaveBodyLoaded(
+        web_time::Instant,
+        WaveSource,
+        #[derivative(Debug = "ignore")] BodyResult,
+    ),
+    #[serde(skip)]
     WavesLoaded(
         WaveSource,
         WaveFormat,
         #[derivative(Debug = "ignore")] Box<WaveContainer>,
         LoadOptions,
+    ),
+    #[serde(skip)]
+    SignalsLoaded(
+        web_time::Instant,
+        #[derivative(Debug = "ignore")] LoadSignalsResult,
     ),
     #[serde(skip)]
     Error(color_eyre::eyre::Error),
@@ -110,6 +150,7 @@ pub enum Message {
     ToggleOverview,
     ToggleStatusbar,
     ToggleIndices,
+    ToggleDirection,
     SetTimeUnit(TimeUnit),
     SetTimeStringFormatting(Option<TimeStringFormatting>),
     CommandPromptClear,
@@ -120,7 +161,8 @@ pub enum Message {
     SelectPrevCommand,
     SelectNextCommand,
     OpenFileDialog(OpenMode),
-    OpenSaveStateDialog,
+    SaveStateFile(Option<PathBuf>),
+    SetStateFile(PathBuf),
     SetAboutVisible(bool),
     SetKeyHelpVisible(bool),
     SetGestureHelpVisible(bool),
@@ -142,10 +184,10 @@ pub enum Message {
     SetArrowKeyBindings(ArrowKeyBindings),
     // Second argument is position to insert after, None inserts after focused item,
     // or last if no focused item
-    AddDivider(Option<String>, Option<usize>),
+    AddDivider(Option<String>, Option<DisplayedItemIndex>),
     // Argument is position to insert after, None inserts after focused item,
     // or last if no focused item
-    AddTimeLine(Option<usize>),
+    AddTimeLine(Option<DisplayedItemIndex>),
     ToggleTickLines,
     ToggleVariableTooltip,
     /// Set a marker at a specific position. If it doesn't exist, it will be created
@@ -155,14 +197,18 @@ pub enum Message {
     },
     MoveMarkerToCursor(u8),
     GoToMarkerPosition(u8, usize),
-    SaveState(PathBuf),
     MoveCursorToTransition {
         next: bool,
-        variable: Option<usize>,
+        variable: Option<DisplayedItemIndex>,
         skip_zero: bool,
     },
-    VariableValueToClipbord(Option<usize>),
+    VariableValueToClipbord(Option<DisplayedItemIndex>),
     InvalidateDrawCommands,
+
+    /// Variable dragging messages
+    VariableDragStarted(DisplayedItemIndex),
+    VariableDragTargetChanged(DisplayedItemIndex),
+    VariableDragFinished,
 
     /// Unpauses the simulation if the wave source supports this kind of interactivity. Otherwise
     /// does nothing
@@ -175,6 +221,12 @@ pub enum Message {
     Batch(Vec<Message>),
     AddViewport,
     RemoveViewport,
+    /// Select Theme
+    SelectTheme(Option<String>),
+    /// Undo the last n changes
+    Undo(usize),
+    /// Redo the last n changes
+    Redo(usize),
     /// Exit the application. This has no effect on wasm and closes the window
     /// on other platforms
     Exit,

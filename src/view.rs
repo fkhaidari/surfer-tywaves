@@ -1,12 +1,13 @@
 use color_eyre::eyre::Context;
 #[cfg(not(target_arch = "wasm32"))]
 use eframe::egui::ViewportCommand;
-use eframe::egui::{self, style::Margin, Align, Layout, Painter, RichText};
-use eframe::egui::{FontSelection, Frame, ScrollArea, Sense, Stroke, Style, TextStyle, WidgetText};
-use eframe::emath::RectTransform;
-use eframe::epaint::text::LayoutJob;
-use eframe::epaint::{Color32, Pos2, Rect, Rounding, Vec2};
-use egui_extras::{Column, TableBuilder, TableRow};
+use eframe::egui::{
+    self, ecolor::Color32, style::Margin, FontSelection, Frame, Layout, Painter, RichText,
+    ScrollArea, Sense, Style, TextStyle, WidgetText,
+};
+use eframe::emath::{Align, Pos2, Rect, RectTransform, Vec2};
+use eframe::epaint::{text::LayoutJob, Rounding, Stroke};
+use egui_remixicon::icons;
 use fzcmd::expand_command;
 use itertools::Itertools;
 use log::{info, warn};
@@ -15,16 +16,18 @@ use log::{info, warn};
 use crate::benchmark::NUM_PERF_SAMPLES;
 use crate::command_prompt::get_parser;
 use crate::config::SurferTheme;
-use crate::displayed_item::{draw_rename_window, DisplayedItem};
+use crate::displayed_item::{
+    draw_rename_window, DisplayedFieldRef, DisplayedItem, DisplayedItemIndex, DisplayedItemRef,
+};
 use crate::help::{
     draw_about_window, draw_control_help_window, draw_license_window, draw_quickstart_help_window,
 };
-use crate::logs::EGUI_LOGGER;
 use crate::time::time_string;
 use crate::translation::{SubFieldFlatTranslationResult, TranslatedValue};
 use crate::util::uint_idx_to_alpha_idx;
+use crate::variable_type::VariableType;
 use crate::wave_container::{FieldRef, ScopeRef, VariableRef};
-use crate::wave_source::{draw_progress_panel, LoadOptions};
+use crate::wave_source::LoadOptions;
 use crate::{
     command_prompt::show_command_prompt, config::HierarchyStyle, hierarchy,
     translation::VariableInfo, wave_data::WaveData, Message, MoveDir, State,
@@ -60,21 +63,22 @@ impl DrawConfig {
 #[derive(Debug)]
 pub struct VariableDrawingInfo {
     pub field_ref: FieldRef,
-    pub item_list_idx: usize,
+    pub displayed_field_ref: DisplayedFieldRef,
+    pub item_list_idx: DisplayedItemIndex,
     pub top: f32,
     pub bottom: f32,
 }
 
 #[derive(Debug)]
 pub struct DividerDrawingInfo {
-    pub item_list_idx: usize,
+    pub item_list_idx: DisplayedItemIndex,
     pub top: f32,
     pub bottom: f32,
 }
 
 #[derive(Debug)]
 pub struct MarkerDrawingInfo {
-    pub item_list_idx: usize,
+    pub item_list_idx: DisplayedItemIndex,
     pub top: f32,
     pub bottom: f32,
     pub idx: u8,
@@ -82,7 +86,7 @@ pub struct MarkerDrawingInfo {
 
 #[derive(Debug)]
 pub struct TimeLineDrawingInfo {
-    pub item_list_idx: usize,
+    pub item_list_idx: DisplayedItemIndex,
     pub top: f32,
     pub bottom: f32,
 }
@@ -113,10 +117,10 @@ impl ItemDrawingInfo {
     }
     pub fn item_list_idx(&self) -> usize {
         match self {
-            ItemDrawingInfo::Variable(drawing_info) => drawing_info.item_list_idx,
-            ItemDrawingInfo::Divider(drawing_info) => drawing_info.item_list_idx,
-            ItemDrawingInfo::Marker(drawing_info) => drawing_info.item_list_idx,
-            ItemDrawingInfo::TimeLine(drawing_info) => drawing_info.item_list_idx,
+            ItemDrawingInfo::Variable(drawing_info) => drawing_info.item_list_idx.0,
+            ItemDrawingInfo::Divider(drawing_info) => drawing_info.item_list_idx.0,
+            ItemDrawingInfo::Marker(drawing_info) => drawing_info.item_list_idx.0,
+            ItemDrawingInfo::TimeLine(drawing_info) => drawing_info.item_list_idx.0,
         }
     }
 }
@@ -171,13 +175,17 @@ impl eframe::App for State {
         self.sys.timing.borrow_mut().end("handle_async_messages");
 
         self.handle_async_messages();
+        self.handle_batch_commands();
         #[cfg(target_arch = "wasm32")]
         self.handle_wasm_external_messages();
 
         // We can save some user battery life by not redrawing unless needed. At the moment,
         // we only need to continuously redraw to make surfer interactive during loading, otherwise
         // we'll let egui manage repainting. In practice
-        if self.sys.continuous_redraw || self.sys.vcd_progress.is_some() || self.show_performance {
+        if self.sys.continuous_redraw
+            || self.sys.progress_tracker.is_some()
+            || self.show_performance
+        {
             ctx.request_repaint();
         }
 
@@ -260,11 +268,11 @@ impl State {
             self.draw_load_url(ctx, &mut msgs);
         }
 
+        if self.show_statusbar() {
+            self.add_statusbar_panel(ctx, &self.waves, &mut msgs);
+        }
         if let Some(waves) = &self.waves {
-            if self.show_statusbar() {
-                self.add_statusbar_panel(ctx, waves, &mut msgs);
-            }
-            if self.show_overview() {
+            if self.show_overview() && !waves.displayed_items_order.is_empty() {
                 self.add_overview_panel(ctx, waves, &mut msgs)
             }
         }
@@ -273,7 +281,7 @@ impl State {
             egui::SidePanel::left("variable select left panel")
                 .default_width(300.)
                 .width_range(100.0..=max_width)
-                .frame(egui::Frame {
+                .frame(Frame {
                     fill: self.config.theme.primary_ui_color.background,
                     ..Default::default()
                 })
@@ -285,10 +293,10 @@ impl State {
 
         if self.sys.command_prompt.visible {
             show_command_prompt(self, ctx, window_size, &mut msgs);
-        }
-
-        if let Some(vcd_progress_data) = &self.sys.vcd_progress {
-            draw_progress_panel(ctx, vcd_progress_data);
+            if let Some(new_idx) = self.sys.command_prompt.new_selection {
+                self.sys.command_prompt.selected = new_idx;
+                self.sys.command_prompt.new_selection = None;
+            }
         }
 
         if self.waves.is_some() {
@@ -363,7 +371,7 @@ impl State {
                 }
 
                 egui::CentralPanel::default()
-                    .frame(egui::Frame {
+                    .frame(Frame {
                         inner_margin: Margin::ZERO,
                         outer_margin: Margin::ZERO,
                         ..Default::default()
@@ -384,13 +392,13 @@ impl State {
                 .map_or(false, |waves| !waves.any_displayed())
         {
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(self.config.theme.canvas_colors.background))
+                .frame(Frame::none().fill(self.config.theme.canvas_colors.background))
                 .show(ctx, |ui| {
                     ui.add_space(max_height * 0.1);
                     ui.vertical_centered(|ui| {
                         ui.label(RichText::new("🏄 Surfer").monospace().size(24.));
                         ui.add_space(20.);
-                        let layout = Layout::top_down(egui::Align::LEFT);
+                        let layout = Layout::top_down(Align::LEFT);
                         ui.allocate_ui_with_layout(
                             Vec2 {
                                 x: max_width * 0.35,
@@ -591,26 +599,47 @@ impl State {
         filter: &str,
     ) {
         for variable in self.filtered_variables(wave, filter, scope) {
-            let index = wave
-                .inner
-                .variable_meta(&variable)
-                .ok()
+            let meta = wave.inner.variable_meta(&variable).ok();
+            let index = meta
                 .as_ref()
                 .and_then(|meta| meta.index.clone())
                 .map(|index| format!(" {index}"))
                 .unwrap_or_default();
 
-            let sig_name = format!("{}{}", variable.name.clone(), index);
+            let direction = if self.show_variable_direction() {
+                meta.as_ref()
+                    .and_then(|meta| meta.direction.clone())
+                    .map(|direction| {
+                        format!(
+                            "{} ",
+                            // Icon based on direction
+                            direction.get_icon().unwrap_or_else(|| {
+                                if meta.unwrap().variable_type == Some(VariableType::VCDParameter) {
+                                    // If parameter
+                                    icons::MAP_PIN_2_LINE
+                                } else {
+                                    // Align other items (can be improved)
+                                    "    "
+                                }
+                            })
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            let variable_name = format!("{}{}{}", direction, variable.name.clone(), index);
             ui.with_layout(
                 Layout::top_down(Align::LEFT).with_cross_justify(true),
                 |ui| {
-                    let mut response = ui.add(egui::SelectableLabel::new(false, sig_name));
+                    let mut response = ui.add(egui::SelectableLabel::new(false, variable_name));
                     if self.show_tooltip() {
                         response = response.on_hover_text(variable_tooltip_text(wave, &variable));
                     }
                     response
                         .clicked()
-                        .then(|| msgs.push(Message::AddVariable(variable.clone())));
+                        .then(|| msgs.push(Message::AddVariables(vec![variable.clone()])));
                 },
             );
         }
@@ -633,31 +662,18 @@ impl State {
                 .iter()
                 .enumerate()
             {
-                self.waves
+                let vidx = vidx.into();
+                if let Some(displayed_item) = self
+                    .waves
                     .as_ref()
                     .unwrap()
                     .displayed_items
                     .get(displayed_item_id)
-                    .map(|displayed_item| match displayed_item {
+                {
+                    let item_rect = match displayed_item {
                         DisplayedItem::Variable(displayed_variable) => {
                             let var = displayed_variable;
                             let info = &displayed_variable.info;
-                            let index = if self
-                                .show_variable_indices
-                                .unwrap_or_else(|| self.config.layout.show_variable_indices())
-                            {
-                                self.waves
-                                    .as_ref()
-                                    .unwrap()
-                                    .inner
-                                    .variable_meta(&var.variable_ref)
-                                    .ok()
-                                    .as_ref()
-                                    .and_then(|meta| meta.index.clone())
-                                    .map(|index| format!(" {index}"))
-                            } else {
-                                None
-                            };
                             let style = Style::default();
                             let mut layout_job = LayoutJob::default();
                             self.add_alpha_id(
@@ -669,7 +685,6 @@ impl State {
                             );
                             displayed_item.add_to_layout_job(
                                 &self.config.theme.foreground,
-                                index,
                                 &style,
                                 &mut layout_job,
                             );
@@ -686,53 +701,54 @@ impl State {
                                 msgs,
                                 vidx,
                                 WidgetText::LayoutJob(layout_job),
+                                *displayed_item_id,
                                 FieldRef::without_fields(var.variable_ref.clone()),
                                 &mut item_offsets,
                                 info,
                                 ui,
-                            );
+                            )
                         }
-                        DisplayedItem::Divider(_) => {
-                            self.draw_plain_item(
-                                msgs,
-                                vidx,
-                                displayed_item,
-                                &mut item_offsets,
-                                ui,
-                                draw_alpha,
-                            );
-                        }
-                        DisplayedItem::Marker(_) => {
-                            self.draw_plain_item(
-                                msgs,
-                                vidx,
-                                displayed_item,
-                                &mut item_offsets,
-                                ui,
-                                draw_alpha,
-                            );
-                        }
-                        DisplayedItem::Placeholder(_) => {
-                            self.draw_plain_item(
-                                msgs,
-                                vidx,
-                                displayed_item,
-                                &mut item_offsets,
-                                ui,
-                                draw_alpha,
-                            );
-                        }
-                        DisplayedItem::TimeLine(_) => {
-                            self.draw_plain_item(
-                                msgs,
-                                vidx,
-                                displayed_item,
-                                &mut item_offsets,
-                                ui,
-                                draw_alpha,
-                            );
-                        }
-                    });
+                        DisplayedItem::Divider(_) => self.draw_plain_item(
+                            msgs,
+                            vidx,
+                            displayed_item,
+                            &mut item_offsets,
+                            ui,
+                            draw_alpha,
+                        ),
+                        DisplayedItem::Marker(_) => self.draw_plain_item(
+                            msgs,
+                            vidx,
+                            displayed_item,
+                            &mut item_offsets,
+                            ui,
+                            draw_alpha,
+                        ),
+                        DisplayedItem::Placeholder(_) => self.draw_plain_item(
+                            msgs,
+                            vidx,
+                            displayed_item,
+                            &mut item_offsets,
+                            ui,
+                            draw_alpha,
+                        ),
+                        DisplayedItem::TimeLine(_) => self.draw_plain_item(
+                            msgs,
+                            vidx,
+                            displayed_item,
+                            &mut item_offsets,
+                            ui,
+                            draw_alpha,
+                        ),
+                    };
+                    self.draw_drag_target(
+                        msgs,
+                        vidx,
+                        item_rect,
+                        ui,
+                        vidx.0 == self.waves.as_ref().unwrap().displayed_items_order.len() - 1,
+                    );
+                };
             }
         });
 
@@ -750,22 +766,45 @@ impl State {
         }
     }
 
+    fn draw_drag_source(
+        &self,
+        msgs: &mut Vec<Message>,
+        vidx: DisplayedItemIndex,
+        item_response: &egui::Response,
+    ) {
+        if item_response.dragged_by(egui::PointerButton::Primary)
+            && item_response.drag_delta().length() > self.config.theme.drag_threshold
+        {
+            msgs.push(Message::VariableDragStarted(vidx));
+        }
+
+        if item_response.drag_released()
+            && self
+                .drag_source_idx
+                .is_some_and(|source_idx| source_idx == vidx)
+        {
+            msgs.push(Message::VariableDragFinished);
+        }
+    }
+
     fn draw_variable(
         &self,
         msgs: &mut Vec<Message>,
-        vidx: usize,
+        vidx: DisplayedItemIndex,
         name: WidgetText,
+        displayed_id: DisplayedItemRef,
         field: FieldRef,
         drawing_infos: &mut Vec<ItemDrawingInfo>,
         info: &VariableInfo,
         ui: &mut egui::Ui,
-    ) {
+    ) -> Rect {
         let draw_label = |ui: &mut egui::Ui| {
             let mut variable_label = ui
                 .selectable_label(self.item_is_selected(vidx), name)
                 .context_menu(|ui| {
                     self.item_context_menu(Some(&field), msgs, ui, vidx);
-                });
+                })
+                .interact(Sense::drag());
 
             if self.show_tooltip() {
                 let tooltip = if let Some(waves) = &self.waves {
@@ -791,9 +830,14 @@ impl State {
                     msgs.push(Message::FocusItem(vidx));
                 }
             }
+
             variable_label
         };
 
+        let displayed_field_ref = DisplayedFieldRef {
+            item: displayed_id,
+            field: field.field.clone(),
+        };
         match info {
             VariableInfo::Compound { subfields } => {
                 let response = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -815,6 +859,7 @@ impl State {
                             msgs,
                             vidx,
                             WidgetText::RichText(RichText::new(name)),
+                            displayed_id,
                             new_path,
                             drawing_infos,
                             info,
@@ -824,11 +869,13 @@ impl State {
                 });
 
                 drawing_infos.push(ItemDrawingInfo::Variable(VariableDrawingInfo {
+                    displayed_field_ref,
                     field_ref: field.clone(),
                     item_list_idx: vidx,
                     top: response.0.rect.top(),
                     bottom: response.0.rect.bottom(),
                 }));
+                response.0.rect
             }
             VariableInfo::Bool
             | VariableInfo::Bits
@@ -836,12 +883,101 @@ impl State {
             | VariableInfo::String
             | VariableInfo::Real => {
                 let label = draw_label(ui);
+                self.draw_drag_source(msgs, vidx, &label);
                 drawing_infos.push(ItemDrawingInfo::Variable(VariableDrawingInfo {
+                    displayed_field_ref,
                     field_ref: field.clone(),
                     item_list_idx: vidx,
                     top: label.rect.top(),
                     bottom: label.rect.bottom(),
                 }));
+                label.rect
+            }
+        }
+    }
+
+    fn draw_drag_target(
+        &self,
+        msgs: &mut Vec<Message>,
+        vidx: DisplayedItemIndex,
+        item_rect: Rect,
+        ui: &mut egui::Ui,
+        last: bool,
+    ) {
+        // Add default margin as it was removed when creating the frame
+        let rect_with_margin = Rect {
+            min: item_rect.min - ui.spacing().item_spacing / 2f32,
+            max: item_rect.max + ui.spacing().item_spacing / 2f32,
+        };
+
+        let vertical_translation_up = Vec2 {
+            x: 0f32,
+            y: -rect_with_margin.height() / 2f32,
+        };
+
+        let before_rect = Rect {
+            min: ui
+                .painter()
+                .round_pos_to_pixels(rect_with_margin.left_top()),
+            max: ui
+                .painter()
+                .round_pos_to_pixels(rect_with_margin.right_bottom() + vertical_translation_up),
+        };
+
+        let expanded_after_rect = if last {
+            ui.max_rect().max
+        } else {
+            rect_with_margin.right_bottom()
+        };
+
+        let after_rect = Rect {
+            min: ui.painter().round_pos_to_pixels(before_rect.left_bottom()),
+            max: ui.painter().round_pos_to_pixels(expanded_after_rect),
+        };
+
+        let half_line_width = Vec2 {
+            x: 0f32,
+            y: self.config.theme.linewidth / 2f32,
+        };
+
+        let vidx = vidx.0;
+        if self.drag_started {
+            if let Some(DisplayedItemIndex(source_idx)) = self.drag_source_idx {
+                let target_idx = if ui.rect_contains_pointer(before_rect) {
+                    ui.painter().rect_filled(
+                        Rect {
+                            min: rect_with_margin.left_top() - half_line_width,
+                            max: rect_with_margin.right_top() + half_line_width,
+                        },
+                        egui::Rounding::ZERO,
+                        self.config.theme.drag_hint_color,
+                    );
+                    if vidx > source_idx {
+                        vidx - 1
+                    } else {
+                        vidx
+                    }
+                } else if ui.rect_contains_pointer(after_rect) {
+                    ui.painter().rect_filled(
+                        Rect {
+                            min: rect_with_margin.left_bottom() - half_line_width,
+                            max: rect_with_margin.right_bottom() + half_line_width,
+                        },
+                        egui::Rounding::ZERO,
+                        self.config.theme.drag_hint_color,
+                    );
+                    if vidx < source_idx {
+                        vidx + 1
+                    } else {
+                        vidx
+                    }
+                } else {
+                    source_idx
+                };
+
+                if source_idx != target_idx {
+                    msgs.push(Message::VariableDragTargetChanged(target_idx.into()));
+                }
             }
         }
     }
@@ -849,12 +985,12 @@ impl State {
     fn draw_plain_item(
         &self,
         msgs: &mut Vec<Message>,
-        vidx: usize,
+        vidx: DisplayedItemIndex,
         displayed_item: &DisplayedItem,
         drawing_infos: &mut Vec<ItemDrawingInfo>,
         ui: &mut egui::Ui,
         draw_alpha: bool,
-    ) {
+    ) -> Rect {
         let mut draw_label = |ui: &mut egui::Ui| {
             let style = Style::default();
             let mut layout_job = LayoutJob::default();
@@ -862,7 +998,7 @@ impl State {
 
             let text_color = self.get_item_text_color(displayed_item);
 
-            displayed_item.add_to_layout_job(text_color, None, &style, &mut layout_job);
+            displayed_item.add_to_layout_job(text_color, &style, &mut layout_job);
             self.add_alpha_id(draw_alpha, vidx, &style, &mut layout_job, Align::RIGHT);
             let item_label = ui
                 .selectable_label(
@@ -871,7 +1007,8 @@ impl State {
                 )
                 .context_menu(|ui| {
                     self.item_context_menu(None, msgs, ui, vidx);
-                });
+                })
+                .interact(Sense::drag());
             if item_label.clicked() {
                 msgs.push(Message::FocusItem(vidx))
             }
@@ -879,6 +1016,7 @@ impl State {
         };
 
         let label = draw_label(ui);
+        self.draw_drag_source(msgs, vidx, &label);
         match displayed_item {
             DisplayedItem::Divider(_) => {
                 drawing_infos.push(ItemDrawingInfo::Divider(DividerDrawingInfo {
@@ -905,12 +1043,13 @@ impl State {
             &DisplayedItem::Variable(_) => {}
             &DisplayedItem::Placeholder(_) => {}
         }
+        label.rect
     }
 
     fn add_alpha_id(
         &self,
         draw_alpha: bool,
-        vidx: usize,
+        vidx: DisplayedItemIndex,
         style: &Style,
         layout_job: &mut LayoutJob,
         alignment: Align,
@@ -922,20 +1061,20 @@ impl State {
                     .as_ref()
                     .map_or(0, |waves| waves.displayed_items.len()),
             );
-            let text = egui::RichText::new(alpha_id)
+            let text = RichText::new(alpha_id)
                 .background_color(self.config.theme.accent_info.background)
                 .monospace()
                 .color(self.config.theme.accent_info.foreground);
             if alignment == Align::LEFT {
                 text.append_to(layout_job, style, FontSelection::Default, Align::Center);
-                egui::RichText::new(" ").append_to(
+                RichText::new(" ").append_to(
                     layout_job,
                     style,
                     FontSelection::Default,
                     Align::Center,
                 );
             } else {
-                egui::RichText::new(" ").append_to(
+                RichText::new(" ").append_to(
                     layout_job,
                     style,
                     FontSelection::Default,
@@ -946,7 +1085,7 @@ impl State {
         }
     }
 
-    fn item_is_selected(&self, vidx: usize) -> bool {
+    fn item_is_selected(&self, vidx: DisplayedItemIndex) -> bool {
         if let Some(waves) = &self.waves {
             waves.focused_item == Some(vidx)
         } else {
@@ -995,6 +1134,7 @@ impl State {
                 .sorted_by_key(|o| o.top() as i32)
                 .enumerate()
             {
+                let vidx = vidx.into();
                 let next_y = ui.cursor().top();
                 // In order to align the text in this view with the variable tree,
                 // we need to keep track of how far away from the expected offset we are,
@@ -1003,7 +1143,15 @@ impl State {
                     ui.add_space(drawing_info.top() - next_y);
                 }
 
-                self.draw_background(vidx, waves, drawing_info, y_zero, &ctx, gap, frame_width);
+                let backgroundcolor = &self.get_background_color(waves, drawing_info, vidx);
+                self.draw_background(
+                    drawing_info,
+                    y_zero,
+                    &ctx,
+                    gap,
+                    frame_width,
+                    backgroundcolor,
+                );
                 match drawing_info {
                     ItemDrawingInfo::Variable(drawing_info) => {
                         if ucursor.as_ref().is_none() {
@@ -1011,9 +1159,17 @@ impl State {
                             continue;
                         }
 
-                        let v = self.get_variable_value(waves, &drawing_info.field_ref, &ucursor);
+                        let v = self.get_variable_value(
+                            waves,
+                            &drawing_info.displayed_field_ref,
+                            &ucursor,
+                        );
                         if let Some(v) = v {
-                            ui.label(v).context_menu(|ui| {
+                            ui.label(
+                                RichText::new(v)
+                                    .color(*self.config.theme.get_best_text_color(backgroundcolor)),
+                            )
+                            .context_menu(|ui| {
                                 self.item_context_menu(
                                     Some(&FieldRef::without_fields(
                                         drawing_info.field_ref.root.clone(),
@@ -1038,7 +1194,11 @@ impl State {
                                 &self.get_time_format(),
                             );
 
-                            ui.label(format!("Δ: {delta}",)).context_menu(|ui| {
+                            ui.label(
+                                RichText::new(format!("Δ: {delta}",))
+                                    .color(*self.config.theme.get_best_text_color(backgroundcolor)),
+                            )
+                            .context_menu(|ui| {
                                 self.item_context_menu(None, msgs, ui, vidx);
                             });
                         } else {
@@ -1056,30 +1216,38 @@ impl State {
     pub fn get_variable_value(
         &self,
         waves: &WaveData,
-        field_ref: &FieldRef,
+        displayed_field_ref: &DisplayedFieldRef,
         ucursor: &Option<num::BigUint>,
     ) -> Option<String> {
         if let Some(ucursor) = ucursor {
-            let variable = &field_ref.root;
-            let translator = waves.variable_translator(field_ref, &self.sys.translators);
+            let Some(DisplayedItem::Variable(displayed_variable)) =
+                waves.displayed_items.get(&displayed_field_ref.item)
+            else {
+                return None;
+            };
+            let variable = &displayed_variable.variable_ref;
+            let translator = waves
+                .variable_translator(&displayed_field_ref.without_field(), &self.sys.translators);
             let meta = waves.inner.variable_meta(variable);
+
             let translation_result = waves
                 .inner
                 .query_variable(variable, ucursor)
                 .ok()
+                .flatten()
                 .and_then(|q| q.current)
                 .map(|(_time, value)| meta.and_then(|meta| translator.translate(&meta, &value)));
 
             if let Some(Ok(s)) = translation_result {
-                let subfields = s
-                    .flatten(
-                        FieldRef::without_fields(field_ref.root.clone()),
-                        &waves.variable_format,
-                        &self.sys.translators,
-                    )
-                    .as_fields();
+                let fields = s.format_flat(
+                    &displayed_variable.format,
+                    &displayed_variable.field_formats,
+                    &self.sys.translators,
+                );
 
-                let subfield = subfields.iter().find(|res| res.names == field_ref.field);
+                let subfield = fields
+                    .iter()
+                    .find(|res| res.names == displayed_field_ref.field);
 
                 if let Some(SubFieldFlatTranslationResult {
                     names: _,
@@ -1100,94 +1268,42 @@ impl State {
 
     pub fn draw_background(
         &self,
-        vidx: usize,
-        waves: &WaveData,
         drawing_info: &ItemDrawingInfo,
         y_zero: f32,
         ctx: &DrawingContext<'_>,
         gap: f32,
         frame_width: f32,
+        background_color: &Color32,
     ) {
-        // Get background color
-        let background_color = *waves
-            .displayed_items
-            .get(&waves.displayed_items_order[drawing_info.item_list_idx()])
-            .and_then(|variable| variable.background_color())
-            .and_then(|color| self.config.theme.get_color(&color))
-            .unwrap_or_else(|| self.get_default_alternating_background_color(vidx));
         // Draw background
         let min = (ctx.to_screen)(0.0, drawing_info.top() - y_zero - gap);
         let max = (ctx.to_screen)(frame_width, drawing_info.bottom() - y_zero + gap);
         ctx.painter
-            .rect_filled(Rect { min, max }, Rounding::ZERO, background_color);
+            .rect_filled(Rect { min, max }, Rounding::ZERO, *background_color);
     }
 
-    fn get_default_alternating_background_color(&self, vidx: usize) -> &Color32 {
+    pub fn get_background_color(
+        &self,
+        waves: &WaveData,
+        drawing_info: &ItemDrawingInfo,
+        vidx: DisplayedItemIndex,
+    ) -> Color32 {
+        *waves
+            .displayed_items
+            .get(&waves.displayed_items_order[drawing_info.item_list_idx()])
+            .and_then(|variable| variable.background_color())
+            .and_then(|color| self.config.theme.get_color(&color))
+            .unwrap_or_else(|| self.get_default_alternating_background_color(vidx))
+    }
+
+    fn get_default_alternating_background_color(&self, vidx: DisplayedItemIndex) -> &Color32 {
         // Set background color
-        if self.config.theme.alt_frequency != 0 && (vidx / self.config.theme.alt_frequency) % 2 == 1
+        if self.config.theme.alt_frequency != 0
+            && (vidx.0 / self.config.theme.alt_frequency) % 2 == 1
         {
             &self.config.theme.canvas_colors.alt_background
         } else {
             &Color32::TRANSPARENT
-        }
-    }
-
-    pub fn draw_log_window(&self, ctx: &egui::Context, msgs: &mut Vec<Message>) {
-        let mut open = true;
-        egui::Window::new("Logs")
-            .open(&mut open)
-            .collapsible(true)
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.style_mut().wrap = Some(false);
-
-                ScrollArea::new([true, false]).show(ui, |ui| {
-                    TableBuilder::new(ui)
-                        .column(Column::auto().resizable(true))
-                        .column(Column::remainder())
-                        .vscroll(true)
-                        .stick_to_bottom(true)
-                        .header(20.0, |mut header| {
-                            header.col(|ui| {
-                                ui.heading("Level");
-                            });
-                            header.col(|ui| {
-                                ui.heading("Message");
-                            });
-                        })
-                        .body(|body| {
-                            let records = EGUI_LOGGER.records();
-                            let heights = records
-                                .iter()
-                                .map(|record| {
-                                    let height = record.msg.lines().count() as f32;
-
-                                    height * 15.
-                                })
-                                .collect::<Vec<_>>();
-
-                            body.heterogeneous_rows(heights.into_iter(), |mut row: TableRow| {
-                                let record = &records[row.index()];
-                                row.col(|ui| {
-                                    let (color, text) = match record.level {
-                                        log::Level::Error => (Color32::RED, "Error"),
-                                        log::Level::Warn => (Color32::YELLOW, "Warn"),
-                                        log::Level::Info => (Color32::GREEN, "Info"),
-                                        log::Level::Debug => (Color32::BLUE, "Debug"),
-                                        log::Level::Trace => (Color32::GRAY, "Trace"),
-                                    };
-
-                                    ui.colored_label(color, text);
-                                });
-                                row.col(|ui| {
-                                    ui.label(RichText::new(record.msg.clone()).monospace());
-                                });
-                            });
-                        })
-                })
-            });
-        if !open {
-            msgs.push(Message::SetLogsVisible(false))
         }
     }
 }
@@ -1195,14 +1311,18 @@ impl State {
 fn variable_tooltip_text(wave: &WaveData, variable: &VariableRef) -> String {
     let meta = wave.inner.variable_meta(variable).ok();
     format!(
-        "{}\nNum bits: {}\nType: {}",
+        "{}\nNum bits: {}\nType: {}\nDirection: {}",
         variable.full_path_string(),
         meta.as_ref()
             .and_then(|meta| meta.num_bits)
             .map(|num_bits| format!("{num_bits}"))
             .unwrap_or_else(|| "unknown".to_string()),
-        meta.and_then(|meta| meta.variable_type)
+        meta.as_ref()
+            .and_then(|meta| meta.variable_type)
             .map(|variable_type| format!("{variable_type}"))
+            .unwrap_or_else(|| "unknown".to_string()),
+        meta.and_then(|meta| meta.direction)
+            .map(|direction| format!("{direction}"))
             .unwrap_or_else(|| "unknown".to_string())
     )
 }

@@ -2,9 +2,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use color_eyre::eyre::WrapErr;
-use eframe::egui::{self, Response, Sense};
-use eframe::emath::{Align2, RectTransform};
-use eframe::epaint::{Color32, FontId, PathShape, Pos2, Rect, RectShape, Rounding, Stroke, Vec2};
+use eframe::egui::{PointerButton, Response, Sense, Ui};
+use eframe::emath::{Align2, Pos2, Rect, RectTransform, Vec2};
+use eframe::epaint::{Color32, FontId, PathShape, RectShape, Rounding, Stroke};
 use itertools::Itertools;
 use log::{error, warn};
 use num::bigint::{ToBigInt, ToBigUint};
@@ -13,13 +13,16 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
 
 use crate::clock_highlighting::draw_clock_edge;
 use crate::config::SurferTheme;
-use crate::displayed_item::DisplayedVariable;
+use crate::displayed_item::{
+    DisplayedFieldRef, DisplayedItemIndex, DisplayedItemRef, DisplayedVariable,
+};
 use crate::translation::{
     SubFieldFlatTranslationResult, TranslatedValue, TranslatorList, ValueKind, VariableInfo,
 };
+use crate::variable_type::VariableType;
 use crate::view::{DrawConfig, DrawingContext, ItemDrawingInfo};
 use crate::viewport::Viewport;
-use crate::wave_container::{FieldRef, QueryResult, VariableRef};
+use crate::wave_container::QueryResult;
 use crate::wave_data::WaveData;
 use crate::{displayed_item::DisplayedItem, CachedDrawData, Message, State};
 
@@ -35,6 +38,7 @@ pub struct DrawnRegion {
 /// be drawn at the *start time* until the *start time* of the next value
 pub struct DrawingCommands {
     is_bool: bool,
+    is_clock: bool,
     values: Vec<(f32, DrawnRegion)>,
 }
 
@@ -43,6 +47,15 @@ impl DrawingCommands {
         Self {
             values: vec![],
             is_bool: true,
+            is_clock: false,
+        }
+    }
+
+    pub fn new_clock() -> Self {
+        Self {
+            values: vec![],
+            is_bool: true,
+            is_clock: true,
         }
     }
 
@@ -50,6 +63,7 @@ impl DrawingCommands {
         Self {
             values: vec![],
             is_bool: false,
+            is_clock: false,
         }
     }
 
@@ -60,13 +74,14 @@ impl DrawingCommands {
 
 struct VariableDrawCommands {
     clock_edges: Vec<f32>,
-    variable_ref: VariableRef,
+    display_id: DisplayedItemRef,
     local_commands: HashMap<Vec<String>, DrawingCommands>,
     local_msgs: Vec<Message>,
 }
 
 fn variable_draw_commands(
     displayed_variable: &DisplayedVariable,
+    display_id: DisplayedItemRef,
     timestamps: &[(f32, num::BigUint)],
     waves: &WaveData,
     translators: &TranslatorList,
@@ -88,10 +103,8 @@ fn variable_draw_commands(
         }
     };
 
-    let translator = waves.variable_translator(
-        &FieldRef::without_fields(displayed_variable.variable_ref.clone()),
-        translators,
-    );
+    let displayed_field_ref: DisplayedFieldRef = display_id.into();
+    let translator = waves.variable_translator(&displayed_field_ref, translators);
     // we need to get the variable info here to get the correct info for aliases
     let info = translator.variable_info(&meta).unwrap();
 
@@ -120,10 +133,10 @@ fn variable_draw_commands(
             .inner
             .query_variable(&displayed_variable.variable_ref, time);
         next_change = match &query_result {
-            Ok(QueryResult {
+            Ok(Some(QueryResult {
                 next: Some(timestamp),
                 ..
-            }) => waves.viewports[viewport_idx].pixel_from_time(
+            })) => waves.viewports[viewport_idx].pixel_from_time(
                 &timestamp.to_bigint().unwrap(),
                 view_width,
                 &waves.num_timestamps(),
@@ -137,11 +150,11 @@ fn variable_draw_commands(
         };
 
         let (change_time, val) = match query_result {
-            Ok(QueryResult {
+            Ok(Some(QueryResult {
                 current: Some((change_time, val)),
                 ..
-            }) => (change_time, val),
-            Ok(QueryResult { current: None, .. }) => continue,
+            })) => (change_time, val),
+            Ok(Some(QueryResult { current: None, .. })) | Ok(None) => continue,
             Err(e) => {
                 error!("Variable query error {e:#?}");
                 continue;
@@ -158,27 +171,31 @@ fn variable_draw_commands(
             Ok(result) => result,
             Err(e) => {
                 error!(
-                    "{translator_name} for {sig_name} failed. Disabling:",
+                    "{translator_name} for {variable_name} failed. Disabling:",
                     translator_name = translator.name(),
-                    sig_name = displayed_variable.variable_ref.full_path_string()
+                    variable_name = displayed_variable.variable_ref.full_path_string()
                 );
                 error!("{e:#}");
-                local_msgs.push(Message::ResetVariableFormat(FieldRef::without_fields(
-                    displayed_variable.variable_ref.clone(),
-                )));
+                local_msgs.push(Message::ResetVariableFormat(displayed_field_ref));
                 return None;
             }
         };
 
-        let fields = translation_result
-            .flatten(
-                FieldRef::without_fields(displayed_variable.variable_ref.clone()),
-                &waves.variable_format,
-                translators,
-            )
-            .as_fields();
+        let fields = translation_result.format_flat(
+            &displayed_variable.format,
+            &displayed_variable.field_formats,
+            translators,
+        );
 
         for SubFieldFlatTranslationResult { names, value } in fields {
+            let entry = local_commands.entry(names.clone()).or_insert_with(|| {
+                match info.get_subinfo(&names) {
+                    VariableInfo::Bool => DrawingCommands::new_bool(),
+                    VariableInfo::Clock => DrawingCommands::new_clock(),
+                    _ => DrawingCommands::new_wide(),
+                }
+            });
+
             let prev = prev_values.get(&names);
 
             // If the value changed between this and the previous pixel, we want to
@@ -192,7 +209,10 @@ fn variable_draw_commands(
 
             // This is not the value we drew last time
             if new_value || is_last_timestep || anti_alias {
-                *prev_values.entry(names.clone()).or_insert(value.clone()) = value.clone();
+                prev_values
+                    .entry(names.clone())
+                    .or_insert(value.clone())
+                    .clone_from(&value);
 
                 if let VariableInfo::Clock = info.get_subinfo(&names) {
                     match value.as_ref().map(|result| result.value.as_str()) {
@@ -206,28 +226,19 @@ fn variable_draw_commands(
                     }
                 }
 
-                local_commands
-                    .entry(names.clone())
-                    .or_insert_with(|| {
-                        if let VariableInfo::Bool | VariableInfo::Clock = info.get_subinfo(&names) {
-                            DrawingCommands::new_bool()
-                        } else {
-                            DrawingCommands::new_wide()
-                        }
-                    })
-                    .push((
-                        *pixel,
-                        DrawnRegion {
-                            inner: value,
-                            force_anti_alias: anti_alias && !new_value,
-                        },
-                    ))
+                entry.push((
+                    *pixel,
+                    DrawnRegion {
+                        inner: value,
+                        force_anti_alias: anti_alias && !new_value,
+                    },
+                ))
             }
         }
     }
     Some(VariableDrawCommands {
         clock_edges,
-        variable_ref: displayed_variable.variable_ref.clone(),
+        display_id,
         local_commands,
         local_msgs,
     })
@@ -253,7 +264,8 @@ impl State {
         self.sys.timing.borrow_mut().start("Generate draw commands");
         let mut draw_commands = HashMap::new();
         if let Some(waves) = &self.waves {
-            let max_time = waves.num_timestamps().clone().to_f64().unwrap_or(f64::MAX);
+            let num_timestamps = waves.num_timestamps().clone();
+            let max_time = num_timestamps.to_f64().unwrap_or(f64::MAX);
             let mut clock_edges = vec![];
             // Compute which timestamp to draw in each pixel. We'll draw from -transition_width to
             // width + transition_width in order to draw initial transitions outside the screen
@@ -262,7 +274,7 @@ impl State {
                 .par_bridge()
                 .filter_map(|x| {
                     let time = waves.viewports[viewport_idx]
-                        .to_time_f64(x as f64, frame_width, &waves.num_timestamps())
+                        .as_time_f64(x as f64, frame_width, &num_timestamps)
                         .0;
                     if time < 0. || time > max_time {
                         None
@@ -277,16 +289,17 @@ impl State {
             let commands = waves
                 .displayed_items_order
                 .par_iter()
-                .map(|id| waves.displayed_items.get(id))
-                .filter_map(|item| match item {
-                    Some(DisplayedItem::Variable(variable_ref)) => Some(variable_ref),
+                .map(|id| (*id, waves.displayed_items.get(id)))
+                .filter_map(|(id, item)| match item {
+                    Some(DisplayedItem::Variable(variable_ref)) => Some((id, variable_ref)),
                     _ => None,
                 })
                 // Iterate over the variables, generating draw commands for all the
                 // subfields
-                .filter_map(|displayed_variable| {
+                .filter_map(|(id, displayed_variable)| {
                     variable_draw_commands(
                         displayed_variable,
+                        id,
                         &timestamps,
                         waves,
                         translators,
@@ -298,17 +311,17 @@ impl State {
 
             for VariableDrawCommands {
                 clock_edges: mut new_clock_edges,
-                variable_ref,
+                display_id,
                 local_commands,
                 mut local_msgs,
             } in commands
             {
                 msgs.append(&mut local_msgs);
-                for (path, val) in local_commands {
+                for (field, val) in local_commands {
                     draw_commands.insert(
-                        FieldRef {
-                            root: variable_ref.clone(),
-                            field: path.clone(),
+                        DisplayedFieldRef {
+                            item: display_id,
+                            field,
                         },
                         val,
                     );
@@ -335,7 +348,7 @@ impl State {
         self.sys.timing.borrow_mut().end("Generate draw commands");
     }
 
-    pub fn draw_items(&mut self, msgs: &mut Vec<Message>, ui: &mut egui::Ui, viewport_idx: usize) {
+    pub fn draw_items(&mut self, msgs: &mut Vec<Message>, ui: &mut Ui, viewport_idx: usize) {
         let (response, mut painter) = ui.allocate_painter(ui.available_size(), Sense::drag());
 
         let cfg = DrawConfig::new(response.rect.size().y);
@@ -366,7 +379,7 @@ impl State {
             }
 
             if ui.input(|i| i.zoom_delta()) != 1. {
-                let mouse_ptr = Some(waves.viewports[viewport_idx].to_time_bigint(
+                let mouse_ptr = Some(waves.viewports[viewport_idx].as_time_bigint(
                     mouse_ptr_pos.x,
                     frame_width,
                     &waves.num_timestamps(),
@@ -393,7 +406,7 @@ impl State {
             }
         });
 
-        response.dragged_by(egui::PointerButton::Primary).then(|| {
+        response.dragged_by(PointerButton::Primary).then(|| {
             if let Some(snap_point) =
                 self.snap_to_edge(pointer_pos_canvas, waves, frame_width, viewport_idx)
             {
@@ -408,7 +421,7 @@ impl State {
         );
 
         response
-            .drag_started_by(egui::PointerButton::Middle)
+            .drag_started_by(PointerButton::Middle)
             .then(|| msgs.push(Message::SetDragStart(pointer_pos_canvas)));
 
         let mut ctx = DrawingContext {
@@ -426,7 +439,18 @@ impl State {
         // compensate for that
         let y_zero = to_screen.transform_pos(Pos2::ZERO).y;
         for (idx, drawing_info) in waves.drawing_infos.iter().enumerate() {
-            self.draw_background(idx, waves, drawing_info, y_zero, &ctx, gap, frame_width);
+            // Get background color
+            let background_color =
+                &self.get_background_color(waves, drawing_info, DisplayedItemIndex(idx));
+
+            self.draw_background(
+                drawing_info,
+                y_zero,
+                &ctx,
+                gap,
+                frame_width,
+                background_color,
+            );
         }
 
         #[cfg(feature = "performance_plot")]
@@ -437,8 +461,10 @@ impl State {
             let draw_clock_edges = match clock_edges.as_slice() {
                 [] => false,
                 [_single] => true,
-                [first, second, ..] => second - first > 15.,
+                [first, second, ..] => second - first > 20.,
             };
+            let draw_clock_rising_marker =
+                draw_clock_edges && self.config.theme.clock_rising_marker;
             let ticks = &draw_data.ticks;
             if !ticks.is_empty() && self.show_ticks() {
                 let stroke = Stroke {
@@ -461,36 +487,73 @@ impl State {
                 }
             }
             let zero_y = to_screen.transform_pos(Pos2::ZERO).y;
-            for drawing_info in &waves.drawing_infos {
+            for (idx, drawing_info) in waves.drawing_infos.iter().enumerate() {
                 // We draw in absolute coords, but the variable offset in the y
                 // direction is also in absolute coordinates, so we need to
                 // compensate for that
                 let y_offset = drawing_info.top() - zero_y;
 
-                let color = waves
+                let displayed_item = waves
                     .displayed_items_order
                     .get(drawing_info.item_list_idx())
-                    .and_then(|id| waves.displayed_items.get(id))
+                    .and_then(|id| waves.displayed_items.get(id));
+                let color = displayed_item
                     .and_then(|variable| variable.color())
                     .and_then(|color| self.config.theme.get_color(&color));
 
                 match drawing_info {
-                    ItemDrawingInfo::Variable(drawing_info) => {
-                        if let Some(commands) = draw_commands.get(&drawing_info.field_ref) {
+                    ItemDrawingInfo::Variable(variable_info) => {
+                        if let Some(commands) =
+                            draw_commands.get(&variable_info.displayed_field_ref)
+                        {
+                            // Get background color and determine best text color
+                            let background_color = self.get_background_color(
+                                waves,
+                                drawing_info,
+                                DisplayedItemIndex(idx),
+                            );
+                            let text_color =
+                                self.config.theme.get_best_text_color(&background_color);
+
+                            let color = *color.unwrap_or_else(|| {
+                                if let Some(DisplayedItem::Variable(variable)) = displayed_item {
+                                    waves
+                                        .inner
+                                        .variable_meta(&variable.variable_ref)
+                                        .ok()
+                                        .and_then(|meta| meta.variable_type)
+                                        .and_then(|var_type| {
+                                            if var_type == VariableType::VCDParameter {
+                                                Some(&self.config.theme.variable_parameter)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .unwrap_or(&self.config.theme.variable_default)
+                                } else {
+                                    &self.config.theme.variable_default
+                                }
+                            });
                             for (old, new) in
                                 commands.values.iter().zip(commands.values.iter().skip(1))
                             {
-                                let color = *color.unwrap_or(&self.config.theme.variable_default);
                                 if commands.is_bool {
                                     self.draw_bool_transition(
                                         (old, new),
                                         new.1.force_anti_alias,
                                         color,
                                         y_offset,
+                                        commands.is_clock && draw_clock_rising_marker,
                                         &mut ctx,
                                     )
                                 } else {
-                                    self.draw_region((old, new), color, y_offset, &mut ctx)
+                                    self.draw_region(
+                                        (old, new),
+                                        color,
+                                        y_offset,
+                                        &mut ctx,
+                                        *text_color,
+                                    )
                                 }
                             }
                         }
@@ -498,8 +561,18 @@ impl State {
                     ItemDrawingInfo::Divider(_) => {}
                     ItemDrawingInfo::Marker(_) => {}
                     ItemDrawingInfo::TimeLine(_) => {
+                        let text_color = color.unwrap_or(
+                            // Get background color and determine best text color
+                            self.config
+                                .theme
+                                .get_best_text_color(&self.get_background_color(
+                                    waves,
+                                    drawing_info,
+                                    DisplayedItemIndex(idx),
+                                )),
+                        );
                         waves.draw_ticks(
-                            color,
+                            Some(text_color),
                             ticks,
                             &ctx,
                             y_offset,
@@ -553,6 +626,7 @@ impl State {
         user_color: Color32,
         offset: f32,
         ctx: &mut DrawingContext,
+        text_color: Color32,
     ) {
         if let Some(prev_result) = &prev_region.inner {
             let stroke = Stroke {
@@ -581,15 +655,15 @@ impl State {
             let char_width = text_size * (20. / 31.);
 
             let text_area = (new_x - old_x) - transition_width;
-            let num_chars = (text_area / char_width).floor();
-            let fits_text = num_chars >= 1.;
+            let num_chars = (text_area / char_width).floor() as usize;
+            let fits_text = num_chars >= 1;
 
             if fits_text {
-                let content = if prev_result.value.len() > num_chars as usize {
+                let content = if prev_result.value.len() > num_chars {
                     prev_result
                         .value
                         .chars()
-                        .take(num_chars as usize - 1)
+                        .take(num_chars - 1)
                         .chain(['…'])
                         .collect::<String>()
                 } else {
@@ -601,7 +675,7 @@ impl State {
                     Align2::LEFT_CENTER,
                     content,
                     FontId::monospace(text_size),
-                    self.config.theme.foreground,
+                    text_color,
                 );
             }
         }
@@ -613,6 +687,7 @@ impl State {
         force_anti_alias: bool,
         color: Color32,
         offset: f32,
+        draw_clock_marker: bool,
         ctx: &mut DrawingContext,
     ) {
         if let (Some(prev_result), Some(new_result)) = (&prev_region.inner, &new_region.inner) {
@@ -647,6 +722,18 @@ impl State {
                 ],
                 stroke,
             ));
+
+            if draw_clock_marker && (old_height < new_height) {
+                ctx.painter.add(PathShape::convex_polygon(
+                    vec![
+                        trace_coords(*new_x - 2.5, 0.6),
+                        trace_coords(*new_x, 0.4),
+                        trace_coords(*new_x + 2.5, 0.6),
+                    ],
+                    old_color,
+                    stroke,
+                ));
+            }
 
             if let Some(old_bg) = old_bg {
                 ctx.painter.add(RectShape {
@@ -730,23 +817,25 @@ impl State {
         frame_width: f32,
         viewport_idx: usize,
     ) -> Option<BigInt> {
-        let Some(pos) = pointer_pos_canvas else {
-            return None;
-        };
+        let pos = pointer_pos_canvas?;
         let viewport = &waves.viewports[viewport_idx];
-        let timestamp = viewport.to_time_bigint(pos.x, frame_width, &waves.num_timestamps());
+        let timestamp = viewport.as_time_bigint(pos.x, frame_width, &waves.num_timestamps());
         if let Some(utimestamp) = timestamp.to_biguint() {
             if let Some(vidx) = waves.get_item_at_y(pos.y) {
                 if let Some(id) = waves.displayed_items_order.get(vidx) {
                     if let DisplayedItem::Variable(variable) = &waves.displayed_items[id] {
-                        if let Ok(res) = waves
+                        if let Ok(Some(res)) = waves
                             .inner
                             .query_variable(&variable.variable_ref, &utimestamp)
                         {
-                            let prev_time = &res.current.unwrap().0.to_bigint().unwrap();
+                            let prev_time = if let Some(v) = res.current {
+                                v.0.to_bigint().unwrap()
+                            } else {
+                                BigInt::ZERO
+                            };
                             let next_time = &res.next.unwrap_or_default().to_bigint().unwrap();
                             let prev = viewport.pixel_from_time(
-                                prev_time,
+                                &prev_time,
                                 frame_width,
                                 &waves.num_timestamps(),
                             );
@@ -759,10 +848,8 @@ impl State {
                                 if (prev - pos.x).abs() <= self.config.snap_distance {
                                     return Some(prev_time.clone());
                                 }
-                            } else {
-                                if (next - pos.x).abs() <= self.config.snap_distance {
-                                    return Some(next_time.clone());
-                                }
+                            } else if (next - pos.x).abs() <= self.config.snap_distance {
+                                return Some(next_time.clone());
                             }
                         }
                     }

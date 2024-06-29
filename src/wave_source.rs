@@ -1,22 +1,28 @@
 use std::fmt::{Display, Formatter};
-use std::sync::{atomic::AtomicU64, Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::cxxrtl_container::CxxrtlContainer;
 use crate::wasm_util::{perform_async_work, perform_work};
 use camino::Utf8PathBuf;
-use color_eyre::eyre::{anyhow, bail, WrapErr};
+use color_eyre::eyre::{anyhow, WrapErr};
 use color_eyre::Result;
-use eframe::egui::{self, DroppedFile};
+use eframe::egui;
 use futures_util::FutureExt;
-use futures_util::TryFutureExt;
-use log::{error, info};
+use log::{error, info, warn};
 use rfd::AsyncFileDialog;
 use serde::{Deserialize, Serialize};
+use web_time::Instant;
 
+use crate::message::{BodyResult, HeaderResult};
+use crate::remote::{Status, HTTP_SERVER_KEY, HTTP_SERVER_VALUE_SURFER};
+use crate::wellen::{LoadSignalPayload, LoadSignalsCmd, LoadSignalsResult};
 use crate::{message::Message, wave_container::WaveContainer, State};
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub enum WaveSource {
     File(Utf8PathBuf),
     Data,
@@ -92,8 +98,6 @@ impl Display for WaveFormat {
 pub struct LoadOptions {
     pub keep_variables: bool,
     pub keep_unavailable: bool,
-    /// Auto-detect if None, otherwise, we error when we get the wrong format.
-    pub expect_format: Option<WaveFormat>,
 }
 
 impl LoadOptions {
@@ -101,15 +105,6 @@ impl LoadOptions {
         Self {
             keep_variables: false,
             keep_unavailable: false,
-            expect_format: None,
-        }
-    }
-
-    pub fn clean_with_expected_format(format: WaveFormat) -> Self {
-        Self {
-            keep_variables: false,
-            keep_unavailable: false,
-            expect_format: Some(format),
         }
     }
 }
@@ -120,39 +115,39 @@ pub enum OpenMode {
     Switch,
 }
 
-pub enum LoadProgress {
-    Downloading(String),
-    Loading(Option<u64>, Arc<AtomicU64>),
+pub struct LoadProgress {
+    pub started: Instant,
+    pub progress: LoadProgressStatus,
 }
 
-const WELLEN_SURFER_DEFAULT_OPTIONS: wellen::vcd::LoadOptions = wellen::vcd::LoadOptions {
+impl LoadProgress {
+    pub fn new(progress: LoadProgressStatus) -> Self {
+        LoadProgress {
+            started: Instant::now(),
+            progress,
+        }
+    }
+}
+
+pub enum LoadProgressStatus {
+    Downloading(String),
+    ReadingHeader(WaveSource),
+    ReadingBody(WaveSource, u64, Arc<AtomicU64>),
+    LoadingVariables(u64),
+}
+
+pub(crate) const WELLEN_SURFER_DEFAULT_OPTIONS: wellen::LoadOptions = wellen::LoadOptions {
     multi_thread: true,
     remove_scopes_with_empty_name: true,
 };
 
-fn check_format(
-    load_options: &LoadOptions,
-    detected_format: wellen::FileFormat,
-    source: &WaveSource,
-) -> Result<WaveFormat> {
-    // check format restrictions
-    match load_options.expect_format {
-        Some(WaveFormat::Vcd) if detected_format != wellen::FileFormat::Vcd => {
-            bail!("{} does not appear to be a VCD file.", source)
-        }
-        Some(WaveFormat::Fst) if detected_format != wellen::FileFormat::Fst => {
-            bail!("{} does not appear to be a FST file.", source)
-        }
-        _ => {} // OK
-    }
-
-    // convert detected file type to Surfer type
-    match detected_format {
-        wellen::FileFormat::Vcd => Ok(WaveFormat::Vcd),
-        wellen::FileFormat::Fst => Ok(WaveFormat::Fst),
-        wellen::FileFormat::Ghw => Ok(WaveFormat::Ghw),
-        wellen::FileFormat::Unknown => bail!("Cannot parse {source}! Unknown format."),
-    }
+macro_rules! spawn {
+    ($task:expr) => {
+        #[cfg(not(target_arch = "wasm32"))]
+        tokio::spawn($task);
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local($task);
+    };
 }
 
 impl State {
@@ -162,74 +157,47 @@ impl State {
         load_options: LoadOptions,
     ) -> Result<()> {
         info!("Loading a waveform file: {filename}");
+        let start = web_time::Instant::now();
         let source = WaveSource::File(filename.clone());
+        let source_copy = source.clone();
         let sender = self.sys.channels.msg_sender.clone();
 
         perform_work(move || {
-            let detected_format = wellen::open_and_detect_file_format(filename.as_str());
-            let format = match check_format(&load_options, detected_format, &source) {
-                Ok(format) => format,
-                Err(e) => {
-                    sender.send(Message::Error(e)).unwrap();
-                    return;
-                }
-            };
-
-            let result = match format {
-                WaveFormat::Vcd => {
-                    wellen::vcd::read_with_options(filename.as_str(), WELLEN_SURFER_DEFAULT_OPTIONS)
-                        .map_err(|e| anyhow!("{e:?}"))
-                        .with_context(|| format!("Failed to parse VCD file: {source}"))
-                }
-                WaveFormat::Fst => wellen::fst::read(filename.as_str())
+            let header_result =
+                wellen::viewers::read_header(filename.as_str(), &WELLEN_SURFER_DEFAULT_OPTIONS)
                     .map_err(|e| anyhow!("{e:?}"))
-                    .with_context(|| format!("Failed to parse FST file: {source}")),
-                WaveFormat::Ghw => wellen::ghw::read(filename.as_str())
-                    .map_err(|e| anyhow!("{e:?}"))
-                    .with_context(|| format!("Failed to parse GHW file: {source}")),
-                WaveFormat::CxxRtl => {
-                    sender
-                        .send(Message::Error(anyhow!(
-                            "load_wave_from_file called with CxxRtl as the wave format"
-                        )))
-                        .unwrap();
-                    return;
-                }
-            };
+                    .with_context(|| format!("Failed to parse wave file: {source}"));
 
-            match result {
-                Ok(waves) => sender
-                    .send(Message::WavesLoaded(
+            match header_result {
+                Ok(header) => {
+                    let msg = Message::WaveHeaderLoaded(
+                        start,
                         source,
-                        format,
-                        Box::new(WaveContainer::new_waveform(waves)),
                         load_options,
-                    ))
-                    .unwrap(),
+                        HeaderResult::Local(Box::new(header)),
+                    );
+                    sender.send(msg).unwrap()
+                }
                 Err(e) => sender.send(Message::Error(e)).unwrap(),
             }
         });
 
+        self.sys.progress_tracker = Some(LoadProgress::new(LoadProgressStatus::ReadingHeader(
+            source_copy,
+        )));
         Ok(())
     }
 
-    pub fn load_vcd_from_data(
+    pub fn load_wave_from_data(
         &mut self,
         vcd_data: Vec<u8>,
         load_options: LoadOptions,
     ) -> Result<()> {
-        let total_bytes = vcd_data.len();
-
-        self.load_vcd_from_bytes(
-            WaveSource::Data,
-            vcd_data,
-            Some(total_bytes as u64),
-            load_options,
-        );
+        self.load_wave_from_bytes(WaveSource::Data, vcd_data, load_options);
         Ok(())
     }
 
-    pub fn load_vcd_from_dropped(&mut self, file: DroppedFile) -> Result<()> {
+    pub fn load_wave_from_dropped(&mut self, file: egui::DroppedFile) -> Result<()> {
         info!("Got a dropped file");
 
         let path = file.path.and_then(|x| Utf8PathBuf::try_from(x).ok());
@@ -238,11 +206,9 @@ impl State {
             if bytes.len() == 0 {
                 Err(anyhow!("Dropped an empty file"))
             } else {
-                let total_bytes = bytes.len();
-                self.load_vcd_from_bytes(
+                self.load_wave_from_bytes(
                     WaveSource::DragAndDrop(path),
                     bytes.to_vec(),
-                    Some(total_bytes as u64),
                     LoadOptions::clean(),
                 );
                 Ok(())
@@ -256,7 +222,7 @@ impl State {
         }
     }
 
-    pub fn load_vcd_from_url(&mut self, url: String, load_options: LoadOptions) {
+    pub fn load_wave_from_url(&mut self, url: String, load_options: LoadOptions) {
         match url_to_wavesource(&url) {
             // We want to support opening cxxrtl urls using open url and friends,
             // so we'll special case
@@ -270,12 +236,36 @@ impl State {
                 let sender = self.sys.channels.msg_sender.clone();
                 let url_ = url.clone();
                 let task = async move {
-                    let bytes = reqwest::get(&url)
+                    let maybe_response = reqwest::get(&url)
                         .map(|e| e.with_context(|| format!("Failed fetch download {url}")))
-                        .and_then(|resp| {
-                            resp.bytes()
-                                .map(|e| e.with_context(|| format!("Failed to download {url}")))
-                        })
+                        .await;
+                    let response: reqwest::Response = match maybe_response {
+                        Ok(r) => r,
+                        Err(e) => {
+                            sender.send(Message::Error(e)).unwrap();
+                            return;
+                        }
+                    };
+
+                    // check to see if the response came from a Surfer running in server mode
+                    if let Some(value) = response.headers().get(HTTP_SERVER_KEY) {
+                        if matches!(value.to_str(), Ok(HTTP_SERVER_VALUE_SURFER)) {
+                            info!("Connecting to a surfer server at: {url}");
+                            // request status and hierarchy
+                            Self::get_server_status(sender.clone(), url.clone(), 0);
+                            Self::get_hierarchy_from_server(
+                                sender.clone(),
+                                url.clone(),
+                                load_options,
+                            );
+                            return;
+                        }
+                    }
+
+                    // otherwise we load the body to get at the file
+                    let bytes = response
+                        .bytes()
+                        .map(|e| e.with_context(|| format!("Failed to download {url}")))
                         .await;
 
                     match bytes {
@@ -284,13 +274,104 @@ impl State {
                     }
                     .unwrap();
                 };
-                #[cfg(not(target_arch = "wasm32"))]
-                tokio::spawn(task);
-                #[cfg(target_arch = "wasm32")]
-                wasm_bindgen_futures::spawn_local(task);
+                spawn!(task);
 
-                self.sys.vcd_progress = Some(LoadProgress::Downloading(url_))
+                self.sys.progress_tracker =
+                    Some(LoadProgress::new(LoadProgressStatus::Downloading(url_)))
             }
+        }
+    }
+    fn get_hierarchy_from_server(
+        sender: Sender<Message>,
+        server: String,
+        load_options: LoadOptions,
+    ) {
+        let start = web_time::Instant::now();
+        let source = WaveSource::Url(server.clone());
+
+        let task = async move {
+            let res = crate::remote::get_hierarchy(server.clone())
+                .await
+                .map_err(|e| anyhow!("{e:?}"))
+                .with_context(|| {
+                    format!("Failed to retrieve hierarchy from remote server {server}")
+                });
+
+            match res {
+                Ok(h) => {
+                    let header = HeaderResult::Remote(Arc::new(h.hierarchy), h.file_format, server);
+                    let msg = Message::WaveHeaderLoaded(start, source, load_options, header);
+                    sender.send(msg).unwrap()
+                }
+                Err(e) => sender.send(Message::Error(e)).unwrap(),
+            }
+        };
+        spawn!(task);
+    }
+
+    pub fn get_time_table_from_server(sender: Sender<Message>, server: String) {
+        let start = web_time::Instant::now();
+        let source = WaveSource::Url(server.clone());
+
+        let task = async move {
+            let res = crate::remote::get_time_table(server.clone())
+                .await
+                .map_err(|e| anyhow!("{e:?}"))
+                .with_context(|| {
+                    format!("Failed to retrieve time table from remote server {server}")
+                });
+
+            match res {
+                Ok(table) => {
+                    let msg =
+                        Message::WaveBodyLoaded(start, source, BodyResult::Remote(table, server));
+                    sender.send(msg).unwrap()
+                }
+                Err(e) => sender.send(Message::Error(e)).unwrap(),
+            }
+        };
+        spawn!(task);
+    }
+
+    fn get_server_status(sender: Sender<Message>, server: String, delay_ms: u64) {
+        let start = web_time::Instant::now();
+        let task = async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            let res = crate::remote::get_status(server.clone())
+                .await
+                .map_err(|e| anyhow!("{e:?}"))
+                .with_context(|| format!("Failed to retrieve status from remote server {server}"));
+
+            match res {
+                Ok(status) => {
+                    let msg = Message::SurferServerStatus(start, server, status);
+                    sender.send(msg).unwrap()
+                }
+                Err(e) => sender.send(Message::Error(e)).unwrap(),
+            }
+        };
+        spawn!(task);
+    }
+
+    /// uses the server status in order to display a loading bar
+    pub fn server_status_to_progress(&mut self, server: String, status: Status) {
+        // once the body is loaded, we are no longer interested in the status
+        let body_loaded = self
+            .waves
+            .as_ref()
+            .map(|w| w.inner.body_loaded())
+            .unwrap_or(false);
+        if !body_loaded {
+            // the progress tracker will be cleared once the hierarchy is returned from the server
+            let source = WaveSource::Url(server.clone());
+            let sender = self.sys.channels.msg_sender.clone();
+            self.sys.progress_tracker = Some(LoadProgress::new(LoadProgressStatus::ReadingBody(
+                source,
+                status.bytes,
+                Arc::new(AtomicU64::new(status.bytes_loaded)),
+            )));
+            // get another status update
+            Self::get_server_status(sender, server, 250);
         }
     }
 
@@ -310,79 +391,158 @@ impl State {
                     LoadOptions {
                         keep_variables,
                         keep_unavailable: false,
-                        expect_format: None,
                     },
                 )),
                 Err(e) => sender.send(Message::Error(e)),
             }
         };
-        #[cfg(not(target_arch = "wasm32"))]
-        tokio::spawn(task);
-        #[cfg(target_arch = "wasm32")]
-        wasm_bindgen_futures::spawn_local(task);
+        spawn!(task);
 
-        self.sys.vcd_progress = Some(LoadProgress::Downloading(url_))
+        self.sys.progress_tracker = Some(LoadProgress::new(LoadProgressStatus::Downloading(url_)))
     }
 
-    pub fn load_vcd_from_bytes(
+    pub fn load_wave_from_bytes(
         &mut self,
         source: WaveSource,
         bytes: Vec<u8>,
-        total_bytes: Option<u64>,
         load_options: LoadOptions,
     ) {
-        // Progress tracking in bytes
-        let progress_bytes = Arc::new(AtomicU64::new(0));
-
+        let start = web_time::Instant::now();
         let sender = self.sys.channels.msg_sender.clone();
-
+        let source_copy = source.clone();
         perform_work(move || {
-            let detected_format = wellen::detect_file_format(&mut std::io::Cursor::new(&bytes));
-            let format = match check_format(&load_options, detected_format, &source) {
-                Ok(format) => format,
-                Err(e) => {
-                    sender.send(Message::Error(e)).unwrap();
-                    return;
-                }
-            };
-
-            let result = match format {
-                WaveFormat::Vcd => {
-                    wellen::vcd::read_from_bytes_with_options(&bytes, WELLEN_SURFER_DEFAULT_OPTIONS)
-                        .map_err(|e| anyhow!("{e:?}"))
-                        .with_context(|| format!("Failed to parse VCD file: {source}"))
-                }
-                WaveFormat::Fst => wellen::fst::read_from_bytes(bytes)
+            let header_result =
+                wellen::viewers::read_header_from_bytes(bytes, &WELLEN_SURFER_DEFAULT_OPTIONS)
                     .map_err(|e| anyhow!("{e:?}"))
-                    .with_context(|| format!("Failed to parse FST file: {source}")),
-                WaveFormat::Ghw => wellen::ghw::read_from_bytes(bytes)
-                    .map_err(|e| anyhow!("{e:?}"))
-                    .with_context(|| format!("Failed to parse GHW file: {source}")),
-                WaveFormat::CxxRtl => {
-                    sender
-                        .send(Message::Error(anyhow!(
-                            "load_vcd_from_bytes called with CxxRtl as the wave format"
-                        )))
-                        .unwrap();
-                    return;
-                }
-            };
+                    .with_context(|| format!("Failed to parse wave file: {source}"));
 
-            match result {
-                Ok(waves) => sender
-                    .send(Message::WavesLoaded(
+            match header_result {
+                Ok(header) => {
+                    let msg = Message::WaveHeaderLoaded(
+                        start,
                         source,
-                        format,
-                        Box::new(WaveContainer::new_waveform(waves)),
                         load_options,
-                    ))
-                    .unwrap(),
+                        HeaderResult::Local(Box::new(header)),
+                    );
+                    sender.send(msg).unwrap()
+                }
                 Err(e) => sender.send(Message::Error(e)).unwrap(),
             }
         });
 
-        info!("Setting VCD progress");
-        self.sys.vcd_progress = Some(LoadProgress::Loading(total_bytes, progress_bytes));
+        self.sys.progress_tracker = Some(LoadProgress::new(LoadProgressStatus::ReadingHeader(
+            source_copy,
+        )));
+    }
+
+    fn get_thread_pool() -> Option<rayon::ThreadPool> {
+        // try to create a new rayon thread pool so that we do not block drawing functionality
+        // which might be blocked by the waveform reader using up all the threads in the global pool
+        match rayon::ThreadPoolBuilder::new().build() {
+            Ok(pool) => Some(pool),
+            Err(e) => {
+                // on wasm this will always fail
+                warn!("failed to create thread pool: {e:?}");
+                None
+            }
+        }
+    }
+
+    pub fn load_wave_body(
+        &mut self,
+        source: WaveSource,
+        cont: wellen::viewers::ReadBodyContinuation,
+        body_len: u64,
+        hierarchy: Arc<wellen::Hierarchy>,
+    ) {
+        let start = web_time::Instant::now();
+        let sender = self.sys.channels.msg_sender.clone();
+        let source_copy = source.clone();
+        let progress = Arc::new(AtomicU64::new(0));
+        let progress_copy = progress.clone();
+        let pool = Self::get_thread_pool();
+
+        perform_work(move || {
+            let action = || {
+                let p = Some(progress_copy);
+                let body_result = wellen::viewers::read_body(cont, &hierarchy, p)
+                    .map_err(|e| anyhow!("{e:?}"))
+                    .with_context(|| format!("Failed to parse body of wave file: {source}"));
+
+                match body_result {
+                    Ok(body) => {
+                        let msg = Message::WaveBodyLoaded(start, source, BodyResult::Local(body));
+                        sender.send(msg).unwrap()
+                    }
+                    Err(e) => sender.send(Message::Error(e)).unwrap(),
+                }
+            };
+            if let Some(pool) = pool {
+                pool.install(action);
+            } else {
+                action();
+            }
+        });
+
+        self.sys.progress_tracker = Some(LoadProgress::new(LoadProgressStatus::ReadingBody(
+            source_copy,
+            body_len,
+            progress,
+        )));
+    }
+
+    pub fn load_variables(&mut self, cmd: LoadSignalsCmd) {
+        let (signals, from_unique_id, payload) = cmd.destruct();
+        if signals.is_empty() {
+            return;
+        }
+        let num_signals = signals.len() as u64;
+        let start = web_time::Instant::now();
+        let sender = self.sys.channels.msg_sender.clone();
+
+        match payload {
+            LoadSignalPayload::Local(mut source, hierarchy) => {
+                let pool = Self::get_thread_pool();
+
+                perform_work(move || {
+                    let action = || {
+                        let loaded = source.load_signals(&signals, &hierarchy, true);
+                        let res = LoadSignalsResult::local(source, loaded, from_unique_id);
+                        let msg = Message::SignalsLoaded(start, res);
+                        sender.send(msg).unwrap();
+                    };
+                    if let Some(pool) = pool {
+                        pool.install(action);
+                    } else {
+                        action();
+                    }
+                });
+            }
+            LoadSignalPayload::Remote(server) => {
+                let task = async move {
+                    let res = crate::remote::get_signals(server.clone(), &signals)
+                        .await
+                        .map_err(|e| anyhow!("{e:?}"))
+                        .with_context(|| {
+                            format!("Failed to retrieve signals from remote server {server}")
+                        });
+
+                    match res {
+                        Ok(loaded) => {
+                            let res = LoadSignalsResult::remote(server, loaded, from_unique_id);
+                            let msg = Message::SignalsLoaded(start, res);
+                            sender.send(msg).unwrap()
+                        }
+                        Err(e) => sender.send(Message::Error(e)).unwrap(),
+                    }
+                };
+                spawn!(task);
+            }
+        }
+
+        self.sys.progress_tracker = Some(LoadProgress::new(LoadProgressStatus::LoadingVariables(
+            num_signals,
+        )));
     }
 
     pub fn open_file_dialog(&mut self, mode: OpenMode) {
@@ -408,11 +568,10 @@ impl State {
                 #[cfg(not(target_arch = "wasm32"))]
                 sender
                     .send(Message::LoadWaveformFile(
-                        camino::Utf8PathBuf::from_path_buf(file.path().to_path_buf()).unwrap(),
+                        Utf8PathBuf::from_path_buf(file.path().to_path_buf()).unwrap(),
                         LoadOptions {
                             keep_variables,
                             keep_unavailable,
-                            expect_format: None,
                         },
                     ))
                     .unwrap();
@@ -426,7 +585,6 @@ impl State {
                             LoadOptions {
                                 keep_variables,
                                 keep_unavailable,
-                                expect_format: None,
                             },
                         ))
                         .unwrap();
@@ -435,52 +593,81 @@ impl State {
         });
     }
 
-    pub fn open_state_save_dialog(&mut self) {
+    pub fn save_state_file(&mut self, path: Option<PathBuf>) {
+        let sender = self.sys.channels.msg_sender.clone();
         let Some(encoded) = self.encode_state() else {
             return;
         };
 
         perform_async_work(async move {
-            if let Some(write_dest) = AsyncFileDialog::new()
-                .set_title("Save state")
-                .add_filter("Surfer state files (*.ron)", &["ron"])
-                .add_filter("All files", &["*"])
-                .save_file()
-                .await
+            let destination = if let Some(path) = path {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    Some(path.into())
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    None
+                }
+            } else {
+                AsyncFileDialog::new()
+                    .set_title("Save state")
+                    .add_filter("Surfer state files (*.ron)", &["ron"])
+                    .add_filter("All files", &["*"])
+                    .save_file()
+                    .await
+            };
+            let Some(destination) = destination else {
+                return;
+            };
+
+            #[cfg(not(target_arch = "wasm32"))]
             {
-                write_dest
+                sender
+                    .send(Message::SetStateFile(destination.path().into()))
+                    .unwrap();
+                destination
                     .write(encoded.as_bytes())
                     .await
-                    .map_err(|e| error!("Failed to write state. {e:#?}"))
+                    .map_err(|e| error!("Failed to write state {e:#?}"))
                     .ok();
             }
         });
     }
 }
 
-pub fn draw_progress_panel(ctx: &egui::Context, vcd_progress_data: &LoadProgress) {
-    egui::TopBottomPanel::top("progress panel").show(ctx, |ui| {
-        ui.vertical_centered_justified(|ui| match vcd_progress_data {
-            LoadProgress::Downloading(url) => {
+pub fn draw_progress_information(ui: &mut egui::Ui, progress_data: &LoadProgress) {
+    match &progress_data.progress {
+        LoadProgressStatus::Downloading(url) => {
+            ui.horizontal(|ui| {
                 ui.spinner();
                 ui.monospace(format!("Downloading {url}"));
-            }
-            LoadProgress::Loading(total_bytes, bytes_done) => {
-                let num_bytes = bytes_done.load(std::sync::atomic::Ordering::Relaxed);
-
-                if let Some(total) = total_bytes {
-                    ui.monospace(format!("Loading. {num_bytes}/{total} bytes loaded"));
-                    let progress = num_bytes as f32 / *total as f32;
-                    let progress_bar = egui::ProgressBar::new(progress)
-                        .show_percentage()
-                        .desired_width(300.);
-
-                    ui.add(progress_bar);
-                } else {
-                    ui.spinner();
-                    ui.monospace(format!("Loading. {num_bytes} bytes loaded"));
-                };
-            }
-        });
-    });
+            });
+        }
+        LoadProgressStatus::ReadingHeader(source) => {
+            ui.spinner();
+            ui.monospace(format!("Loading variable names from {source}"));
+        }
+        LoadProgressStatus::ReadingBody(source, 0, _) => {
+            ui.spinner();
+            ui.monospace(format!("Loading variable change data from {source}"));
+        }
+        LoadProgressStatus::LoadingVariables(num) => {
+            ui.spinner();
+            ui.monospace(format!("Loading {num} variables"));
+        }
+        LoadProgressStatus::ReadingBody(source, total, bytes_done) => {
+            let num_bytes = bytes_done.load(std::sync::atomic::Ordering::SeqCst);
+            let progress = num_bytes as f32 / *total as f32;
+            ui.monospace(format!(
+                "Loading variable change data from {source}. {} / {}",
+                bytesize::ByteSize::b(num_bytes),
+                bytesize::ByteSize::b(*total),
+            ));
+            let progress_bar = egui::ProgressBar::new(progress)
+                .show_percentage()
+                .desired_width(300.);
+            ui.add(progress_bar);
+        }
+    };
 }

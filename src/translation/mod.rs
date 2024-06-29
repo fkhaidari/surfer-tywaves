@@ -1,7 +1,11 @@
 use std::{collections::HashMap, sync::mpsc::Sender};
 
 use color_eyre::Result;
+#[cfg(not(target_arch = "wasm32"))]
+use directories::ProjectDirs;
 use eframe::epaint::Color32;
+use log::warn;
+use toml::Table;
 
 mod basic_translators;
 pub mod clock;
@@ -11,43 +15,164 @@ pub mod spade;
 pub mod tywaves_translator;
 
 pub use basic_translators::*;
+use instruction_decoder::Decoder;
 use itertools::Itertools;
 use num::BigUint;
 pub use numeric_translators::*;
 
+use crate::wave_container::VariableEncoding;
 use crate::{
     message::Message,
-    variable_type::STRING_TYPES,
-    wave_container::{FieldRef, VariableMeta, VariableValue},
+    wave_container::{VariableMeta, VariableValue},
 };
 
+/// Look inside the config directory for user-defined decoders
+/// To add a new decoder named 'x', add a directory 'x' to the decoders directory
+/// Inside, multiple toml files can be added which will all be used for decoding 'x'
+/// This is useful e.g., for layering RISC-V extensions
+#[cfg(not(target_arch = "wasm32"))]
+fn find_user_decoders() -> Vec<Box<dyn BasicTranslator>> {
+    let mut decoders: Vec<Box<dyn BasicTranslator>> = vec![];
+    if let Some(proj_dirs) = ProjectDirs::from("org", "surfer-project", "surfer") {
+        let Ok(decoder_dirs) = std::fs::read_dir(proj_dirs.config_dir().join("decoders")) else {
+            return vec![];
+        };
+
+        for decoder_dir in decoder_dirs.flatten() {
+            if decoder_dir.metadata().is_ok_and(|m| m.is_dir()) {
+                let Ok(name) = decoder_dir.file_name().into_string() else {
+                    warn!("Cannot load decoder. Invalid name.");
+                    continue;
+                };
+                let mut tomls = vec![];
+                // Keeps track of the bit width of the first parsed toml
+                // All tomls must use the same width
+                let mut width: Option<toml::Value> = None;
+
+                if let Ok(toml_files) = std::fs::read_dir(decoder_dir.path()) {
+                    for toml_file in toml_files.flatten() {
+                        if toml_file
+                            .file_name()
+                            .into_string()
+                            .is_ok_and(|file_name| file_name.ends_with(".toml"))
+                        {
+                            let Ok(text) = std::fs::read_to_string(toml_file.path()) else {
+                                warn!(
+                                    "Skipping toml file {:?}. Cannot read file.",
+                                    toml_file.path()
+                                );
+                                continue;
+                            };
+
+                            let Ok(toml_parsed) = text.parse::<Table>() else {
+                                warn!(
+                                    "Skipping toml file {:?}. Cannot parse toml.",
+                                    toml_file.path()
+                                );
+                                continue;
+                            };
+
+                            let Some(toml_width) = toml_parsed.get("width") else {
+                                warn!(
+                                    "Skipping toml file {:?}. Mandatory key 'width' is missing.",
+                                    toml_file.path()
+                                );
+                                continue;
+                            };
+
+                            if width.clone().is_some_and(|width| width != *toml_width) {
+                                warn!(
+                                    "Skipping toml file {:?}. Bit widths do not match.",
+                                    toml_file.path()
+                                );
+                                continue;
+                            } else {
+                                width = Some(toml_width.clone());
+                            }
+
+                            tomls.push(toml_parsed)
+                        }
+                    }
+                }
+
+                if let Some(width) = width.and_then(|width| width.as_integer()) {
+                    decoders.push(Box::new(InstructionTranslator {
+                        name,
+                        decoder: Decoder::new_from_table(tomls),
+                        num_bits: width.unsigned_abs(),
+                    }));
+                }
+            }
+        }
+    }
+    decoders
+}
+
 pub fn all_translators() -> TranslatorList {
+    let mut basic_decoders: Vec<Box<dyn BasicTranslator>> = vec![
+        Box::new(BitTranslator {}),
+        Box::new(HexTranslator {}),
+        Box::new(OctalTranslator {}),
+        Box::new(UnsignedTranslator {}),
+        Box::new(SignedTranslator {}),
+        Box::new(GroupingBinaryTranslator {}),
+        Box::new(BinaryTranslator {}),
+        Box::new(ASCIITranslator {}),
+        Box::new(SinglePrecisionTranslator {}),
+        Box::new(DoublePrecisionTranslator {}),
+        Box::new(HalfPrecisionTranslator {}),
+        Box::new(BFloat16Translator {}),
+        Box::new(Posit32Translator {}),
+        Box::new(Posit16Translator {}),
+        Box::new(Posit8Translator {}),
+        Box::new(PositQuire8Translator {}),
+        Box::new(PositQuire16Translator {}),
+        Box::new(E5M2Translator {}),
+        Box::new(E4M3Translator {}),
+        Box::new(InstructionTranslator {
+            name: "RV32".into(),
+            decoder: Decoder::new(&[
+                include_str!("../../instruction-decoder/toml/RV32I.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV32M.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV32Zicsr.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV32F.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV32A.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV32D.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV32V.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV32_Zbb.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV32_Zbs.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV_Zba.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV_Zbc.toml").to_string(),
+            ]),
+            num_bits: 32,
+        }),
+        Box::new(InstructionTranslator {
+            name: "RV64".into(),
+            decoder: Decoder::new(&[
+                include_str!("../../instruction-decoder/toml/RV64_Zbb.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV64_Zbs.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV_Zba.toml").to_string(),
+                include_str!("../../instruction-decoder/toml/RV_Zbc.toml").to_string(),
+            ]),
+            num_bits: 32,
+        }),
+        Box::new(InstructionTranslator {
+            name: "Mips".into(),
+            decoder: Decoder::new(&[
+                include_str!("../../instruction-decoder/toml/mips.toml").to_string()
+            ]),
+            num_bits: 32,
+        }),
+        Box::new(LebTranslator {}),
+        #[cfg(feature = "f128")]
+        Box::new(QuadPrecisionTranslator {}),
+    ];
+
+    #[cfg(not(target_arch = "wasm32"))]
+    basic_decoders.append(&mut find_user_decoders());
+
     TranslatorList::new(
-        vec![
-            Box::new(BitTranslator {}),
-            Box::new(HexTranslator {}),
-            Box::new(OctalTranslator {}),
-            Box::new(UnsignedTranslator {}),
-            Box::new(SignedTranslator {}),
-            Box::new(GroupingBinaryTranslator {}),
-            Box::new(BinaryTranslator {}),
-            Box::new(ASCIITranslator {}),
-            Box::new(SinglePrecisionTranslator {}),
-            Box::new(DoublePrecisionTranslator {}),
-            Box::new(HalfPrecisionTranslator {}),
-            Box::new(BFloat16Translator {}),
-            Box::new(Posit32Translator {}),
-            Box::new(Posit16Translator {}),
-            Box::new(Posit8Translator {}),
-            Box::new(PositQuire8Translator {}),
-            Box::new(PositQuire16Translator {}),
-            Box::new(E5M2Translator {}),
-            Box::new(E4M3Translator {}),
-            Box::new(RiscvTranslator {}),
-            Box::new(LebTranslator {}),
-            #[cfg(feature = "f128")]
-            Box::new(QuadPrecisionTranslator {}),
-        ],
+        basic_decoders,
         vec![
             Box::new(clock::ClockTranslator::new()),
             Box::new(StringTranslator {}),
@@ -184,23 +309,22 @@ pub struct SubFieldFlatTranslationResult {
     pub value: Option<TranslatedValue>,
 }
 
-pub struct FlatTranslationResult {
-    /// The string representation of the translated result
+// A tree of format results for a variable, to be flattened into `SubFieldFlatTranslationResult`s
+struct HierFormatResult {
+    pub names: Vec<String>,
     pub this: Option<TranslatedValue>,
     /// A list of subfields of arbitrary depth, flattened to remove hierarchy.
     /// i.e. `{a: {b: 0}, c: 0}` is flattened to `vec![a: {b: 0}, [a, b]: 0, c: 0]`
-    pub fields: Vec<SubFieldFlatTranslationResult>,
+    pub fields: Vec<HierFormatResult>,
 }
 
-impl FlatTranslationResult {
-    pub fn as_fields(self) -> Vec<SubFieldFlatTranslationResult> {
-        vec![SubFieldFlatTranslationResult {
-            names: vec![],
+impl HierFormatResult {
+    pub fn collect_into(self, into: &mut Vec<SubFieldFlatTranslationResult>) {
+        into.push(SubFieldFlatTranslationResult {
+            names: self.names,
             value: self.this,
-        }]
-        .into_iter()
-        .chain(self.fields)
-        .collect()
+        });
+        self.fields.into_iter().for_each(|r| r.collect_into(into));
     }
 }
 
@@ -226,150 +350,174 @@ pub struct TranslationResult {
     pub kind: ValueKind,
 }
 
-impl TranslationResult {
-    /// Flattens the translation result into path, value pairs
-    pub fn flatten(
-        &self,
-        path_so_far: FieldRef,
-        formats: &HashMap<FieldRef, String>,
-        translators: &TranslatorList,
-    ) -> FlatTranslationResult {
-        let subresults = self
-            .subfields
-            .iter()
-            .map(|res| {
-                let sub_path = path_so_far
-                    .field
-                    .clone()
-                    .into_iter()
-                    .chain(vec![res.name.clone()])
-                    .collect();
+fn format(
+    val: &ValueRepr,
+    kind: ValueKind,
+    subtranslator_name: &String,
+    translators: &TranslatorList,
+    subresults: &[HierFormatResult],
+) -> Option<TranslatedValue> {
+    match val {
+        ValueRepr::Bit(val) => {
+            let subtranslator = translators
+                .basic
+                .get(subtranslator_name)
+                .unwrap_or_else(|| panic!("Did not find a translator named {subtranslator_name}"));
 
-                let sub = res.result.flatten(
-                    FieldRef {
-                        root: path_so_far.root.clone(),
-                        field: sub_path,
-                    },
-                    formats,
-                    translators,
-                );
-                (&res.name, sub)
-            })
-            .collect::<Vec<_>>();
+            Some(TranslatedValue::from_basic_translate(
+                subtranslator
+                    .as_ref()
+                    .basic_translate(1, &VariableValue::String(val.to_string())),
+            ))
+        }
+        ValueRepr::Bits(bit_count, bits) => {
+            let subtranslator = translators
+                .basic
+                .get(subtranslator_name)
+                .unwrap_or_else(|| panic!("Did not find a translator named {subtranslator_name}"));
 
-        let string_repr = match &self.val {
-            ValueRepr::Bit(val) => {
-                let subtranslator_name = formats.get(&path_so_far).unwrap_or(&translators.default);
-
-                let subtranslator =
-                    translators
-                        .basic
-                        .get(subtranslator_name)
-                        .unwrap_or_else(|| {
-                            panic!("Did not find a translator named {subtranslator_name}")
-                        });
-
-                Some(TranslatedValue::from_basic_translate(
-                    subtranslator
+            Some(TranslatedValue::from_basic_translate(
+                subtranslator
+                    .as_ref()
+                    .basic_translate(*bit_count, &VariableValue::String(bits.clone())),
+            ))
+        }
+        ValueRepr::String(sval) => Some(TranslatedValue {
+            value: sval.clone(),
+            kind,
+        }),
+        ValueRepr::Tuple => Some(TranslatedValue {
+            value: format!(
+                "({})",
+                subresults
+                    .iter()
+                    .map(|v| v
+                        .this
                         .as_ref()
-                        .basic_translate(1, &VariableValue::String(val.to_string())),
-                ))
-            }
-            ValueRepr::Bits(bit_count, bits) => {
-                let subtranslator_name = formats.get(&path_so_far).unwrap_or(&translators.default);
-
-                let subtranslator =
-                    translators
-                        .basic
-                        .get(subtranslator_name)
-                        .unwrap_or_else(|| {
-                            panic!("Did not find a translator named {subtranslator_name}")
-                        });
-
-                Some(TranslatedValue::from_basic_translate(
-                    subtranslator
-                        .as_ref()
-                        .basic_translate(*bit_count, &VariableValue::String(bits.clone())),
-                ))
-            }
-            ValueRepr::String(sval) => Some(TranslatedValue {
-                value: sval.clone(),
-                kind: self.kind,
-            }),
-            ValueRepr::Tuple => Some(TranslatedValue {
-                value: format!(
-                    "({})",
-                    subresults
-                        .iter()
-                        .map(|(_, v)| v
-                            .this
-                            .as_ref()
-                            .map(|t| t.value.as_str())
-                            .unwrap_or_else(|| "-"))
-                        .join(", ")
-                ),
-                kind: self.kind,
-            }),
-            ValueRepr::Struct => Some(TranslatedValue {
-                value: format!(
-                    "{{{}}}",
-                    subresults
-                        .iter()
-                        .map(|(n, v)| format!(
+                        .map(|t| t.value.as_str())
+                        .unwrap_or_else(|| "-"))
+                    .join(", ")
+            ),
+            kind,
+        }),
+        ValueRepr::Struct => Some(TranslatedValue {
+            value: format!(
+                "{{{}}}",
+                subresults
+                    .iter()
+                    .map(|v| {
+                        let n = v.names.join("_");
+                        format!(
                             "{n}: {}",
                             v.this
                                 .as_ref()
                                 .map(|t| t.value.as_str())
                                 .unwrap_or_else(|| "-")
-                        ))
-                        .join(", ")
-                ),
-                kind: self.kind,
-            }),
-            ValueRepr::Array => Some(TranslatedValue {
-                value: format!(
-                    "[{}]",
-                    subresults
-                        .iter()
-                        .map(|(_, v)| v
-                            .this
-                            .as_ref()
-                            .map(|t| t.value.as_str())
-                            .unwrap_or_else(|| "-"))
-                        .join(", ")
-                ),
-                kind: self.kind,
-            }),
-            ValueRepr::NotPresent => None,
-            ValueRepr::Enum { idx, name } => Some(TranslatedValue {
-                value: format!(
-                    "{name}{{{}}}",
-                    subresults[*idx]
-                        .1
+                        )
+                    })
+                    .join(", ")
+            ),
+            kind,
+        }),
+        ValueRepr::Array => Some(TranslatedValue {
+            value: format!(
+                "[{}]",
+                subresults
+                    .iter()
+                    .map(|v| v
                         .this
                         .as_ref()
                         .map(|t| t.value.as_str())
-                        .unwrap_or_else(|| "-")
-                ),
-                kind: self.kind,
-            }),
-        };
+                        .unwrap_or_else(|| "-"))
+                    .join(", ")
+            ),
+            kind,
+        }),
+        ValueRepr::NotPresent => None,
+        ValueRepr::Enum { idx, name } => Some(TranslatedValue {
+            value: format!(
+                "{name}{{{}}}",
+                subresults[*idx]
+                    .this
+                    .as_ref()
+                    .map(|t| t.value.as_str())
+                    .unwrap_or_else(|| "-")
+            ),
+            kind,
+        }),
+    }
+}
 
-        FlatTranslationResult {
-            this: string_repr,
-            fields: subresults
-                .into_iter()
-                .flat_map(|(n, sub)| {
-                    sub.as_fields()
-                        .into_iter()
-                        .map(|mut result| {
-                            result.names.insert(0, n.clone());
-                            result
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect(),
-        }
+impl TranslationResult {
+    fn sub_format(
+        &self,
+        formats: &[crate::displayed_item::FieldFormat],
+        translators: &TranslatorList,
+        path_so_far: &[String],
+    ) -> Vec<HierFormatResult> {
+        self.subfields
+            .iter()
+            .map(|res| {
+                let sub_path = path_so_far
+                    .iter()
+                    .chain([&res.name])
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                let sub = res.result.sub_format(formats, translators, &sub_path);
+
+                // we can consistently fall back to the default here since sub-fields
+                // are never checked for their preferred translator
+                let translator_name = formats
+                    .iter()
+                    .find(|e| e.field == sub_path)
+                    .map(|e| e.format.clone())
+                    .unwrap_or(translators.default.clone());
+                let formatted = format(
+                    &res.result.val,
+                    res.result.kind,
+                    &translator_name,
+                    translators,
+                    &sub,
+                );
+
+                HierFormatResult {
+                    this: formatted,
+                    names: sub_path,
+                    fields: sub,
+                }
+            })
+            .collect::<Vec<_>>()
+    }
+
+    /// Flattens the translation result into path, value pairs
+    pub fn format_flat(
+        &self,
+        root_format: &Option<String>,
+        formats: &[crate::displayed_item::FieldFormat],
+        translators: &TranslatorList,
+    ) -> Vec<SubFieldFlatTranslationResult> {
+        let sub_result = self.sub_format(formats, translators, &[]);
+
+        // FIXME for consistency we should not fall back to `translators.default` here, but fetch the
+        // preferred translator - but doing that ATM will break if the spade translator is used, since
+        // on the first render the spade translator seems to not have loaded it's information yet.
+        let formatted = format(
+            &self.val,
+            self.kind,
+            root_format.as_ref().unwrap_or(&translators.default),
+            translators,
+            &sub_result,
+        );
+
+        let formatted = HierFormatResult {
+            names: vec![],
+            this: formatted,
+            fields: sub_result,
+        };
+        let mut collected = vec![];
+        formatted.collect_into(&mut collected);
+        collected
     }
 }
 
@@ -435,10 +583,10 @@ pub enum TranslationPreference {
 }
 
 pub fn translates_all_bit_types(variable: &VariableMeta) -> Result<TranslationPreference> {
-    if STRING_TYPES.contains(&variable.variable_type) {
-        Ok(TranslationPreference::No)
-    } else {
+    if variable.encoding == VariableEncoding::BitVector {
         Ok(TranslationPreference::Yes)
+    } else {
+        Ok(TranslationPreference::No)
     }
 }
 
@@ -514,7 +662,11 @@ impl Translator for StringTranslator {
         value: &VariableValue,
     ) -> Result<TranslationResult> {
         match value {
-            VariableValue::BigUint(_) => panic!(),
+            VariableValue::BigUint(b) => Ok(TranslationResult {
+                val: ValueRepr::String(format!("ERROR (0x{:x})", b)),
+                kind: ValueKind::Warn,
+                subfields: vec![],
+            }),
             VariableValue::String(s) => Ok(TranslationResult {
                 val: ValueRepr::String((*s).to_string()),
                 kind: ValueKind::Normal,
@@ -528,7 +680,10 @@ impl Translator for StringTranslator {
     }
 
     fn translates(&self, variable: &VariableMeta) -> Result<TranslationPreference> {
-        if STRING_TYPES.contains(&variable.variable_type) {
+        // f64 (i.e. "real") values are treated as strings for now
+        if variable.encoding == VariableEncoding::String
+            || variable.encoding == VariableEncoding::Real
+        {
             Ok(TranslationPreference::Prefer)
         } else {
             Ok(TranslationPreference::No)

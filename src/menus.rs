@@ -4,7 +4,7 @@ use eframe::egui::{menu, Button, Context, TopBottomPanel, Ui};
 use crate::{
     clock_highlighting::clock_highlight_type_menu,
     config::{ArrowKeyBindings, HierarchyStyle},
-    displayed_item::DisplayedItem,
+    displayed_item::{DisplayedFieldRef, DisplayedItem, DisplayedItemIndex},
     message::Message,
     time::{timeformat_menu, timeunit_menu},
     translation::TranslationPreference,
@@ -85,12 +85,23 @@ impl State {
             )
             .shortcut("r")
             .add_closing_menu(msgs, ui);
-            b("Save state...", Message::OpenSaveStateDialog).add_closing_menu(msgs, ui);
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let save_text = if self.state_file.is_some() {
+                    "Save state"
+                } else {
+                    "Save state..."
+                };
+                b(save_text, Message::SaveStateFile(self.state_file.clone()))
+                    .add_closing_menu(msgs, ui);
+            }
+            b("Save state as...", Message::SaveStateFile(None)).add_closing_menu(msgs, ui);
             b("Open URL...", Message::SetUrlEntryVisible(true)).add_closing_menu(msgs, ui);
             #[cfg(not(target_arch = "wasm32"))]
             b("Exit", Message::Exit).add_closing_menu(msgs, ui);
         });
-        ui.menu_button("View", |ui| {
+        ui.menu_button("View", |ui: &mut Ui| {
             ui.style_mut().wrap = Some(false);
             if waves_loaded {
                 b(
@@ -146,6 +157,13 @@ impl State {
             b("Toggle full screen", Message::ToggleFullscreen)
                 .shortcut("F11")
                 .add_closing_menu(msgs, ui);
+            ui.menu_button("Theme", |ui| {
+                b("Default Theme", Message::SelectTheme(None)).add_closing_menu(msgs, ui);
+                for theme_name in self.config.theme.theme_names.clone() {
+                    b(theme_name.clone(), Message::SelectTheme(Some(theme_name)))
+                        .add_closing_menu(msgs, ui);
+                }
+            });
         });
 
         ui.menu_button("Settings", |ui| {
@@ -249,6 +267,12 @@ impl State {
                     ui.close_menu();
                     msgs.push(Message::ToggleIndices)
                 });
+            ui.radio(self.show_variable_direction(), "Show variable direction")
+                .clicked()
+                .then(|| {
+                    ui.close_menu();
+                    msgs.push(Message::ToggleDirection)
+                });
         });
         ui.menu_button("Help", |ui| {
             b("Quick start", Message::SetQuickStartVisible(true)).add_closing_menu(msgs, ui);
@@ -270,19 +294,24 @@ impl State {
         path: Option<&FieldRef>,
         msgs: &mut Vec<Message>,
         ui: &mut Ui,
-        vidx: usize,
+        vidx: DisplayedItemIndex,
     ) {
         let Some(waves) = &self.waves else { return };
+
+        let (displayed_item_id, displayed_item) = waves
+            .displayed_items_order
+            .get(vidx.0)
+            .map(|id| (*id, &waves.displayed_items[id]))
+            .unwrap();
+
         if let Some(path) = path {
-            self.add_format_menu(path, msgs, ui);
+            let dfr = DisplayedFieldRef {
+                item: displayed_item_id,
+                field: path.field.clone(),
+            };
+            self.add_format_menu(&dfr, displayed_item, path, msgs, ui);
         }
 
-        // let displayed_item = &waves.displayed_items[vidx];
-        let displayed_item = waves
-            .displayed_items_order
-            .get(vidx)
-            .and_then(|id| Some(&waves.displayed_items[id]))
-            .unwrap();
         ui.menu_button("Color", |ui| {
             let selected_color = &displayed_item
                 .color()
@@ -378,16 +407,23 @@ impl State {
         });
     }
 
-    fn add_format_menu(&self, path: &FieldRef, msgs: &mut Vec<Message>, ui: &mut Ui) {
+    fn add_format_menu(
+        &self,
+        displayed_field_ref: &DisplayedFieldRef,
+        displayed_item: &DisplayedItem,
+        path: &FieldRef,
+        msgs: &mut Vec<Message>,
+        ui: &mut Ui,
+    ) {
         // Should not call this unless a variable is selected, and, hence, a VCD is loaded
         let Some(waves) = &self.waves else { return };
 
-        let mut available_translators = if path.field.is_empty() {
+        let (mut preferred_translators, mut bad_translators) = if path.field.is_empty() {
             self.sys
                 .translators
                 .all_translator_names()
                 .into_iter()
-                .filter(|translator_name| {
+                .partition(|translator_name| {
                     let t = self.sys.translators.get_translator(translator_name);
 
                     if self
@@ -418,34 +454,45 @@ impl State {
                         }
                     }
                 })
-                .collect()
         } else {
-            self.sys.translators.basic_translator_names()
+            (self.sys.translators.basic_translator_names(), vec![])
         };
 
-        available_translators.sort_by(|a, b| human_sort::compare(a, b));
-        let format_menu = available_translators
-            .iter()
-            .map(|t| {
-                (
-                    *t,
-                    Message::VariableFormatChange(path.clone(), t.to_string()),
-                )
-            })
-            .collect::<Vec<_>>();
+        preferred_translators.sort_by(|a, b| numeric_sort::cmp(a, b));
+        bad_translators.sort_by(|a, b| numeric_sort::cmp(a, b));
 
-        let selected_translator = waves
-            .variable_translator(path, &self.sys.translators)
-            .name();
+        let selected_translator = match displayed_item {
+            DisplayedItem::Variable(var) => Some(var),
+            _ => None,
+        }
+        .and_then(|displayed_variable| displayed_variable.get_format(&displayed_field_ref.field));
+
+        let mut menu_entry = |ui: &mut Ui, name: &String| {
+            ui.radio(
+                selected_translator.map(|st| st == name).unwrap_or(false),
+                name,
+            )
+            .clicked()
+            .then(|| {
+                ui.close_menu();
+                msgs.push(Message::VariableFormatChange(
+                    displayed_field_ref.clone(),
+                    name.to_string(),
+                ));
+            });
+        };
 
         ui.menu_button("Format", |ui| {
-            for (name, msg) in format_menu {
-                ui.radio(selected_translator == *name, name)
-                    .clicked()
-                    .then(|| {
-                        ui.close_menu();
-                        msgs.push(msg);
-                    });
+            for name in preferred_translators {
+                menu_entry(ui, name);
+            }
+            if !bad_translators.is_empty() {
+                ui.separator();
+                ui.menu_button("Not recommended", |ui| {
+                    for name in bad_translators {
+                        menu_entry(ui, name);
+                    }
+                });
             }
         });
     }

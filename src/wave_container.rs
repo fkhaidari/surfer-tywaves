@@ -5,15 +5,16 @@ use chrono::prelude::{DateTime, Utc};
 use color_eyre::{eyre::bail, Result};
 use num::BigUint;
 use serde::{Deserialize, Serialize};
-use wellen::{self, VarRef, Waveform};
+use wellen::{self, VarRef};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::cxxrtl_container::CxxrtlContainer;
-use crate::wellen::var_to_meta;
+use crate::message::BodyResult;
+use crate::variable_direction::VariableDirection;
+use crate::wellen::{var_to_meta, LoadSignalsCmd, LoadSignalsResult, WellenContainer};
 use crate::{
     time::{TimeScale, TimeUnit},
     variable_type::VariableType,
-    wellen::WellenContainer,
 };
 
 #[derive(Debug, Clone)]
@@ -49,7 +50,7 @@ impl std::hash::Hash for ScopeRef {
     }
 }
 
-impl std::cmp::PartialEq for ScopeRef {
+impl PartialEq for ScopeRef {
     fn eq(&self, other: &Self) -> bool {
         // id is intentionally not compared, since it is only a performance hint
         self.strs.eq(&other.strs)
@@ -272,7 +273,7 @@ impl FieldRef {
     pub fn from_strs(root: &[&str], field: &[&str]) -> Self {
         Self {
             root: VariableRef::from_strs(root),
-            field: field.into_iter().map(|s| s.to_string()).collect(),
+            field: field.iter().map(|s| s.to_string()).collect(),
         }
     }
 }
@@ -284,7 +285,7 @@ pub struct QueryResult {
 }
 
 pub enum WaveContainer {
-    Wellen(WellenContainer),
+    Wellen(Box<WellenContainer>),
     /// A wave container that contains nothing. Currently, the only practical use for this is
     /// a placehodler when serializing and deserializing wave state.
     Empty,
@@ -293,8 +294,15 @@ pub enum WaveContainer {
 }
 
 impl WaveContainer {
-    pub fn new_waveform(waveform: Waveform) -> Self {
-        WaveContainer::Wellen(WellenContainer::new(waveform))
+    pub fn new_waveform(hierarchy: std::sync::Arc<wellen::Hierarchy>) -> Self {
+        WaveContainer::Wellen(Box::new(WellenContainer::new(hierarchy, None)))
+    }
+
+    pub fn new_remote_waveform(
+        server_url: String,
+        hierarchy: std::sync::Arc<wellen::Hierarchy>,
+    ) -> Self {
+        WaveContainer::Wellen(Box::new(WellenContainer::new(hierarchy, Some(server_url))))
     }
 
     /// Creates a new empty wave container. Should only be used as a default for serde. If
@@ -313,6 +321,18 @@ impl WaveContainer {
         }
     }
 
+    /// Returns true if all requested signals have been loaded.
+    /// Used for testing to make sure the GUI is at its final state before taking a
+    /// snapshot.
+    pub fn is_fully_loaded(&self) -> bool {
+        match self {
+            WaveContainer::Wellen(f) => f.is_fully_loaded(),
+            WaveContainer::Empty => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            WaveContainer::Cxxrtl(_) => true,
+        }
+    }
+
     /// Returns the full names of all variables in the design.
     pub fn variable_names(&self) -> Vec<String> {
         match self {
@@ -320,7 +340,7 @@ impl WaveContainer {
             WaveContainer::Empty => vec![],
             // I don't know if we can do
             #[cfg(not(target_arch = "wasm32"))]
-            WaveContainer::Cxxrtl(_) => vec![], // FIXME: List signals
+            WaveContainer::Cxxrtl(_) => vec![], // FIXME: List variable names
         }
     }
 
@@ -338,17 +358,7 @@ impl WaveContainer {
             WaveContainer::Wellen(f) => f.variables_in_scope(scope),
             WaveContainer::Empty => vec![],
             #[cfg(not(target_arch = "wasm32"))]
-            WaveContainer::Cxxrtl(c) => c.lock().unwrap().signals_in_module(scope),
-        }
-    }
-
-    /// Loads a variable into memory. Needs to be called before using `query_variable` on the variable.
-    pub fn load_variable(&mut self, r: &VariableRef) -> Result<()> {
-        match self {
-            WaveContainer::Wellen(f) => f.load_variable(r),
-            WaveContainer::Empty => bail!("Cannot load variable from empty container."),
-            #[cfg(not(target_arch = "wasm32"))]
-            WaveContainer::Cxxrtl(c) => Ok(c.lock().unwrap().load_signal(r)),
+            WaveContainer::Cxxrtl(c) => c.lock().unwrap().variables_in_module(scope),
         }
     }
 
@@ -356,12 +366,30 @@ impl WaveContainer {
     pub fn load_variables<S: AsRef<VariableRef>, T: Iterator<Item = S>>(
         &mut self,
         variables: T,
-    ) -> Result<()> {
+    ) -> Result<Option<LoadSignalsCmd>> {
         match self {
             WaveContainer::Wellen(f) => f.load_variables(variables),
             WaveContainer::Empty => bail!("Cannot load variables from empty container."),
             #[cfg(not(target_arch = "wasm32"))]
-            WaveContainer::Cxxrtl(c) => Ok(c.lock().unwrap().load_signals(variables)),
+            WaveContainer::Cxxrtl(c) => {
+                c.get_mut().unwrap().load_variables(variables);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Callback for when wellen signals have been loaded. Might lead to a new load variable
+    /// command since new variables might have been requested in the meantime
+    pub fn on_signals_loaded(&mut self, res: LoadSignalsResult) -> Result<Option<LoadSignalsCmd>> {
+        match self {
+            WaveContainer::Wellen(f) => f.on_signals_loaded(res),
+            WaveContainer::Empty => {
+                bail!("on_load_signals should only be called with the wellen backend.")
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            WaveContainer::Cxxrtl(_) => {
+                bail!("on_load_signals should only be called with the wellen backend.")
+            }
         }
     }
 
@@ -373,16 +401,23 @@ impl WaveContainer {
             }
             WaveContainer::Empty => bail!("Getting meta from empty wave container"),
             #[cfg(not(target_arch = "wasm32"))]
-            WaveContainer::Cxxrtl(c) => c.lock().unwrap().signal_meta(r),
+            WaveContainer::Cxxrtl(c) => c.lock().unwrap().variable_meta(r),
         }
     }
 
-    pub fn query_variable(&self, variable: &VariableRef, time: &BigUint) -> Result<QueryResult> {
+    /// Query the value of the variable at a certain time step.
+    /// Returns `None` if we do not have any values for the variable.
+    /// That generally happens if the corresponding variable is still being loaded.
+    pub fn query_variable(
+        &self,
+        variable: &VariableRef,
+        time: &BigUint,
+    ) -> Result<Option<QueryResult>> {
         match self {
             WaveContainer::Wellen(f) => f.query_variable(variable, time),
             WaveContainer::Empty => bail!("Querying variable from empty wave container"),
             #[cfg(not(target_arch = "wasm32"))]
-            WaveContainer::Cxxrtl(c) => Ok(c.lock().unwrap().query_signal(variable, time)),
+            WaveContainer::Cxxrtl(c) => Ok(c.lock().unwrap().query_variable(variable, time)),
         }
     }
 
@@ -407,7 +442,7 @@ impl WaveContainer {
                 .unwrap()
                 .modules()
                 .iter()
-                .map(|m| m.strs().last().cloned().unwrap_or(format!("root")))
+                .map(|m| m.strs().last().cloned().unwrap_or("root".to_string()))
                 .collect(),
         }
     }
@@ -465,7 +500,7 @@ impl WaveContainer {
                 .lock()
                 .unwrap()
                 .max_timestamp()
-                .map(|t| t.into_femtoseconds()),
+                .map(|t| t.as_femtoseconds()),
         }
     }
 
@@ -522,12 +557,44 @@ impl WaveContainer {
             WaveContainer::Cxxrtl(c) => c.lock().unwrap().pause(),
         }
     }
+
+    /// Called for `wellen` container, when the body of the waveform file has been parsed.
+    pub fn wellen_add_body(&mut self, body: BodyResult) -> Result<Option<LoadSignalsCmd>> {
+        match self {
+            WaveContainer::Wellen(inner) => inner.add_body(body),
+            _ => {
+                bail!("Should never call this function on a non wellen container!")
+            }
+        }
+    }
+
+    pub fn body_loaded(&self) -> bool {
+        match self {
+            WaveContainer::Wellen(inner) => inner.body_loaded(),
+            WaveContainer::Empty => true,
+            #[cfg(not(target_arch = "wasm32"))]
+            WaveContainer::Cxxrtl(_) => true,
+        }
+    }
 }
 
+#[derive(Clone)]
 pub struct VariableMeta {
     pub var: VariableRef,
     pub num_bits: Option<u32>,
+    /// Type of the variable in the HDL (on a best effort basis).
     pub variable_type: Option<VariableType>,
     pub index: Option<String>,
+    pub direction: Option<VariableDirection>,
     pub enum_map: HashMap<String, String>,
+    /// Indicates how the variable is stored. A variable of "type" boolean for example
+    /// could be stored as a String or as a BitVector.
+    pub encoding: VariableEncoding,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum VariableEncoding {
+    String,
+    Real,
+    BitVector,
 }

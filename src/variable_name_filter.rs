@@ -133,13 +133,11 @@ impl State {
                         // waves in the same order as the variable
                         // list
                         if let Some(active_scope) = waves.active_scope.as_ref() {
-                            for var in self
-                                .filtered_variables(waves, filter, active_scope)
-                                .into_iter()
-                                .rev()
-                            {
-                                msgs.push(Message::AddVariable(var))
-                            }
+                            msgs.push(Message::AddVariables(self.filtered_variables(
+                                waves,
+                                filter,
+                                active_scope,
+                            )))
                         }
                     }
                 });
@@ -195,7 +193,7 @@ impl State {
                 .inner
                 .variables_in_scope(scope)
                 .iter()
-                .sorted_by(|a, b| human_sort::compare(&a.name, &b.name))
+                .sorted_by(|a, b| numeric_sort::cmp(&a.name, &b.name))
                 .cloned()
                 .collect_vec()
         } else {
@@ -206,7 +204,7 @@ impl State {
                     self.variable_name_filter_case_insensitive,
                 )
                 .iter()
-                .sorted_by(|a, b| human_sort::compare(&a.name, &b.name))
+                .sorted_by(|a, b| numeric_sort::cmp(&a.name, &b.name))
                 .cloned()
                 .collect_vec()
         }

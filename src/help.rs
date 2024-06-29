@@ -51,11 +51,6 @@ impl State {
         ui.add_space(20.0);
         ui.separator();
         ui.add_space(20.0);
-        if self.show_wave_source {
-            if let Some(waves) = &self.waves {
-                ui.label(RichText::new(format!("Filename: {}", waves.source)).monospace());
-            }
-        }
 
         #[cfg(target_arch = "wasm32")]
         {
@@ -204,6 +199,7 @@ fn key_listing(ui: &mut Ui) {
         ("", "Ctrl+j/⬇", "Move focused item down"),
         ("", "Alt+k/⬆", "Move focus up"),
         ("", "Alt+j/⬇", "Move focus down"),
+        ("", "u/Shift+u", "Undo/redo last change"),
         ("", "Ctrl+0-9", "Add numbered marker"),
         ("", "0-9", "Center view at numbered marker"),
         (icons::REWIND_START_FILL, "s", "Go to start"),
@@ -214,22 +210,22 @@ fn key_listing(ui: &mut Ui) {
         (
             icons::PLAY_FILL,
             "➡/l",
-            "Go to next transition of focused signal (changeable in config)",
+            "Go to next transition of focused variable (changeable in config)",
         ),
         (
             icons::PLAY_REVERSE_FILL,
             "⬅/h",
-            "Go to previous transition of focused item (changeable in config)",
+            "Go to previous transition of focused variable (changeable in config)",
         ),
         (
             "",
             "Ctrl+➡/l",
-            "Go to next non-zero transition of focused item",
+            "Go to next non-zero transition of focused variable",
         ),
         (
             "",
             "Ctrl+⬅/h",
-            "Go to previous non-zero transition of focused signal",
+            "Go to previous non-zero transition of focused variable",
         ),
         (icons::DELETE_BIN_2_FILL, "x/Delete", "Delete focused item"),
         #[cfg(not(target_arch = "wasm32"))]

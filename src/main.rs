@@ -1,3 +1,5 @@
+#![deny(unused_crate_dependencies)]
+
 #[cfg(feature = "performance_plot")]
 mod benchmark;
 mod clock_highlighting;
@@ -18,6 +20,7 @@ mod menus;
 mod message;
 mod mousegestures;
 mod overview;
+mod remote;
 mod state_util;
 mod statusbar;
 #[cfg(test)]
@@ -26,6 +29,7 @@ mod time;
 mod toolbar;
 mod translation;
 mod util;
+mod variable_direction;
 mod variable_name_filter;
 mod variable_name_type;
 mod variable_type;
@@ -47,16 +51,21 @@ use clap::Parser;
 use color_eyre::eyre::Context;
 use color_eyre::Result;
 use command_prompt::get_parser;
-use config::SurferConfig;
+use config::{SurferConfig, SurferTheme};
+use displayed_item::DisplayedFieldRef;
 use displayed_item::DisplayedItem;
+use displayed_item::DisplayedItemIndex;
+use displayed_item::DisplayedItemRef;
+use displayed_item::FieldFormat;
 use eframe::egui;
 use eframe::egui::style::Selection;
 use eframe::egui::style::WidgetVisuals;
 use eframe::egui::style::Widgets;
+use eframe::egui::FontData;
 use eframe::egui::FontDefinitions;
+use eframe::egui::FontFamily;
 use eframe::egui::Visuals;
-use eframe::emath;
-use eframe::epaint::Rect;
+use eframe::emath::{Pos2, Rect, Vec2};
 use eframe::epaint::Rounding;
 use eframe::epaint::Stroke;
 #[cfg(not(target_arch = "wasm32"))]
@@ -70,6 +79,7 @@ use log::trace;
 use log::warn;
 use logs::EGUI_LOGGER;
 use message::Message;
+use num::BigInt;
 use ron::ser::PrettyConfig;
 use serde::Deserialize;
 use serde::Serialize;
@@ -86,7 +96,6 @@ use variable_name_filter::VariableNameFilterType;
 use viewport::Viewport;
 use wasm_util::perform_work;
 use wasm_util::UrlArgs;
-use wave_container::FieldRef;
 use wave_container::VariableRef;
 use wave_container::WaveContainer;
 use wave_data::WaveData;
@@ -96,15 +105,21 @@ use wave_source::LoadProgress;
 use wave_source::WaveFormat;
 use wave_source::WaveSource;
 
+use crate::message::HeaderResult;
+use crate::wellen::convert_format;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::fmt::Display;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::sync::RwLock;
+
+#[cfg(target_os = "windows")]
+use winapi as _;
 
 lazy_static! {
     pub static ref EGUI_CONTEXT: RwLock<Option<Arc<eframe::egui::Context>>> = RwLock::new(None);
@@ -156,6 +171,9 @@ struct Args {
 
     #[clap(long, short)]
     state_file: Option<Utf8PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
 impl Args {
@@ -170,6 +188,23 @@ impl Args {
             &self.script
         }
     }
+}
+
+#[derive(clap::Subcommand)]
+enum Commands {
+    #[cfg(not(target_arch = "wasm32"))]
+    /// starts surfer in headless mode so that a user can connect to it
+    Server {
+        /// port on which server will listen
+        #[clap(long)]
+        port: Option<u16>,
+        /// token used by the client to authenticate to the server
+        #[clap(long)]
+        token: Option<String>,
+        /// waveform file that we want to serve
+        #[arg(long)]
+        file: String,
+    },
 }
 
 struct StartupParams {
@@ -250,9 +285,10 @@ fn setup_logging(platform_logger: Dispatch) -> Result<()> {
     Ok(())
 }
 
-// When compiling natively:
+/// Starts the logging and error handling. Can be used by unittests to get more insights.
 #[cfg(not(target_arch = "wasm32"))]
-fn main() -> Result<()> {
+#[inline]
+pub fn start_logging() -> Result<()> {
     let colors = ColoredLevelConfig::new()
         .error(fern::colors::Color::Red)
         .warn(fern::colors::Color::Yellow)
@@ -274,16 +310,37 @@ fn main() -> Result<()> {
     setup_logging(stdout_config)?;
 
     color_eyre::install()?;
+    Ok(())
+}
+
+// When compiling natively:
+#[cfg(not(target_arch = "wasm32"))]
+fn main() -> Result<()> {
+    start_logging()?;
 
     // https://tokio.rs/tokio/topics/bridging
     // We want to run the gui in the main thread, but some long running tasks like
-    // laoading VCDs should be done asynchronously. We can't just use std::thread to
+    // loading VCDs should be done asynchronously. We can't just use std::thread to
     // do that due to wasm support, so we'll start a tokio runtime
     let runtime = tokio::runtime::Builder::new_current_thread()
         .worker_threads(1)
         .enable_all()
         .build()
         .unwrap();
+
+    // parse arguments
+    let args = Args::parse();
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(Commands::Server { port, token, file }) = args.command {
+        let default_port = 8911; // FIXME: make this more configurable
+        let res = runtime.block_on(remote::server_main(
+            port.unwrap_or(default_port),
+            token,
+            file,
+            None,
+        ));
+        return res;
+    }
 
     let _enter = runtime.enter();
 
@@ -295,7 +352,6 @@ fn main() -> Result<()> {
         })
     });
 
-    let args = Args::parse();
     let mut state = match &args.state_file {
         Some(file) => std::fs::read_to_string(file)
             .with_context(|| format!("Failed to read state from {file}"))
@@ -314,7 +370,7 @@ fn main() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(app_name)
-            .with_inner_size(egui::Vec2::new(
+            .with_inner_size(Vec2::new(
                 state.config.layout.window_width as f32,
                 state.config.layout.window_height as f32,
             )),
@@ -382,7 +438,17 @@ fn main() -> Result<()> {
 
 fn setup_custom_font(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    egui_remixicon::add_to_fonts(&mut fonts);
+
+    fonts.font_data.insert(
+        "remix_icons".to_owned(),
+        FontData::from_static(egui_remixicon::FONT),
+    );
+
+    fonts
+        .families
+        .get_mut(&FontFamily::Proportional)
+        .unwrap()
+        .push("remix_icons".to_owned());
 
     ctx.set_fonts(fonts);
 }
@@ -393,13 +459,22 @@ pub enum MoveDir {
     Down,
 }
 
+impl Display for MoveDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MoveDir::Up => write!(f, "up"),
+            MoveDir::Down => write!(f, "down"),
+        }
+    }
+}
+
 pub enum ColorSpecifier {
     Index(usize),
     Name(String),
 }
 
 struct CachedDrawData {
-    pub draw_commands: HashMap<FieldRef, drawing_canvas::DrawingCommands>,
+    pub draw_commands: HashMap<DisplayedFieldRef, drawing_canvas::DrawingCommands>,
     pub clock_edges: Vec<f32>,
     pub ticks: Vec<(String, f32)>,
 }
@@ -419,14 +494,23 @@ impl Channels {
     }
 }
 
+/// Stores the current canvas state to enable undo/redo operations
+struct CanvasState {
+    message: String,
+    focused_item: Option<DisplayedItemIndex>,
+    displayed_item_order: Vec<DisplayedItemRef>,
+    displayed_items: HashMap<DisplayedItemRef, DisplayedItem>,
+    markers: HashMap<u8, BigInt>,
+}
+
 pub struct SystemState {
     /// Which translator to use for each variable
     translators: TranslatorList,
     /// Channels for messages generated by other threads
     channels: Channels,
 
-    /// The number of bytes loaded from the VCD file
-    vcd_progress: Option<LoadProgress>,
+    /// Tracks progress of file/variable loading operations.
+    progress_tracker: Option<LoadProgress>,
 
     /// Buffer for the command input
     command_prompt: command_prompt::CommandPrompt,
@@ -434,15 +518,16 @@ pub struct SystemState {
     /// The context to egui, we need this to change the visual settings when the config is reloaded
     context: Option<Arc<eframe::egui::Context>>,
 
-    // List of unparsed commands to run at startup after the first wave has been loaded
-    startup_commands: Vec<String>,
+    /// List of batch commands which will executed as soon as possible
+    batch_commands: VecDeque<Message>,
+    batch_commands_completed: bool,
 
     /// The draw commands for every variable currently selected
     // For performance reasons, these need caching so we have them in a RefCell for interior
     // mutability
     draw_data: RefCell<Vec<Option<CachedDrawData>>>,
 
-    gesture_start_location: Option<emath::Pos2>,
+    gesture_start_location: Option<Pos2>,
 
     // Egui requires a place to store text field content between frames
     url: RefCell<String>,
@@ -458,6 +543,16 @@ pub struct SystemState {
     rendering_cpu_times: VecDeque<f32>,
     #[cfg(feature = "performance_plot")]
     timing: RefCell<Timing>,
+
+    // Undo and Redo stacks
+    undo_stack: Vec<CanvasState>,
+    redo_stack: Vec<CanvasState>,
+}
+
+impl Default for SystemState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SystemState {
@@ -470,16 +565,18 @@ impl SystemState {
         Self {
             translators,
             channels,
-            vcd_progress: None,
+            progress_tracker: None,
             command_prompt: command_prompt::CommandPrompt {
                 visible: false,
                 suggestions: vec![],
                 selected: 0,
+                new_selection: None,
                 previous_commands: vec![],
             },
             context: None,
             gesture_start_location: None,
-            startup_commands: vec![],
+            batch_commands: VecDeque::new(),
+            batch_commands_completed: false,
             url: RefCell::new(String::new()),
             command_prompt_text: RefCell::new(String::new()),
             draw_data: RefCell::new(vec![None]),
@@ -492,6 +589,8 @@ impl SystemState {
             rendering_cpu_times: VecDeque::new(),
             #[cfg(feature = "performance_plot")]
             timing: RefCell::new(Timing::new()),
+            undo_stack: vec![],
+            redo_stack: vec![],
         }
     }
 }
@@ -511,8 +610,12 @@ pub struct State {
     show_statusbar: Option<bool>,
     align_names_right: Option<bool>,
     show_variable_indices: Option<bool>,
+    show_variable_direction: Option<bool>,
 
     waves: Option<WaveData>,
+    drag_started: bool,
+    drag_source_idx: Option<DisplayedItemIndex>,
+    drag_target_idx: Option<DisplayedItemIndex>,
 
     previous_waves: Option<WaveData>,
 
@@ -527,9 +630,6 @@ pub struct State {
     show_gestures: bool,
     show_quick_start: bool,
     show_license: bool,
-    /// Hide the wave source. For now, this is only used in snapshot tests to avoid problems
-    /// with absolute path diffs
-    show_wave_source: bool,
     show_performance: bool,
     show_logs: bool,
     show_cursor_window: bool,
@@ -539,10 +639,18 @@ pub struct State {
     variable_name_filter_focused: bool,
     variable_name_filter_type: VariableNameFilterType,
     variable_name_filter_case_insensitive: bool,
-    rename_target: Option<usize>,
+    rename_target: Option<DisplayedItemIndex>,
 
     /// UI zoom factor if set by the user
     ui_zoom_factor: Option<f32>,
+
+    // Path of last saved-to state file
+    // Do not serialize as this causes a few issues and doesn't help:
+    // - We need to set it on load of a state anyways since the file could have been renamed
+    // - Bad interoperatility story between native and wasm builds
+    // - Sequencing issue in serialization, due to us having to run that async
+    #[serde(skip)]
+    state_file: Option<PathBuf>,
 
     /// Internal state that does not persist between sessions and is not serialized
     #[serde(skip, default = "SystemState::new")]
@@ -581,7 +689,6 @@ impl State {
             show_url_entry: false,
             show_quick_start: false,
             rename_target: None,
-            show_wave_source: true,
             variable_name_filter_focused: false,
             variable_name_filter_type: VariableNameFilterType::Fuzzy,
             variable_name_filter_case_insensitive: true,
@@ -593,16 +700,19 @@ impl State {
             show_tooltip: None,
             show_overview: None,
             show_statusbar: None,
+            show_variable_direction: None,
             align_names_right: None,
             show_variable_indices: None,
+            drag_started: false,
+            drag_source_idx: None,
+            drag_target_idx: None,
+            state_file: None,
         };
 
         Ok(result)
     }
 
     fn with_params(mut self, args: StartupParams) -> Self {
-        self.sys.startup_commands = args.startup_commands;
-
         self.previous_waves = self.waves;
         self.waves = None;
 
@@ -638,8 +748,16 @@ impl State {
             });
         }
 
+        // we turn the waveform argument and any startup command file into batch commands
+        self.sys.batch_commands = VecDeque::new();
+
         match args.waves {
-            Some(WaveSource::Url(url)) => self.load_vcd_from_url(url, LoadOptions::clean()),
+            Some(WaveSource::Url(url)) => {
+                self.add_startup_message(Message::LoadWaveformFileFromUrl(
+                    url,
+                    LoadOptions::clean(),
+                ));
+            }
             Some(WaveSource::File(wave_file)) => {
                 let file = if let Some(hgldd_dir) = hgldd_dir {
                     let tywaves_translator = tywaves_translator::TywavesTranslator::new(
@@ -659,14 +777,12 @@ impl State {
                 } else {
                     wave_file
                 };
-
-                self.load_wave_from_file(file, LoadOptions::clean())
-                    .unwrap()
+                self.add_startup_message(Message::LoadWaveformFile(file, LoadOptions::clean()))
             }
             Some(WaveSource::Data) => error!("Attempted to load data at startup"),
             #[cfg(not(target_arch = "wasm32"))]
             Some(WaveSource::CxxrtlTcp(url)) => {
-                self.connect_to_cxxrtl(url, false);
+                self.add_startup_message(Message::ConnectToCxxrtl(url));
             }
             Some(WaveSource::DragAndDrop(_)) => {
                 error!("Attempted to load from drag and drop at startup (how?)")
@@ -674,7 +790,28 @@ impl State {
             None => {}
         }
 
+        self.add_startup_commands(args.startup_commands);
+
         self
+    }
+
+    pub fn add_startup_commands<I: IntoIterator<Item = String>>(&mut self, commands: I) {
+        let parsed = self.parse_startup_commands(commands);
+        for msg in parsed.into_iter() {
+            self.sys.batch_commands.push_back(msg);
+            self.sys.batch_commands_completed = false;
+        }
+    }
+
+    pub fn add_startup_messages<I: IntoIterator<Item = Message>>(&mut self, messages: I) {
+        for msg in messages.into_iter() {
+            self.sys.batch_commands.push_back(msg);
+            self.sys.batch_commands_completed = false;
+        }
+    }
+
+    pub fn add_startup_message(&mut self, msg: Message) {
+        self.add_startup_messages([msg])
     }
 
     pub fn update(&mut self, message: Message) {
@@ -689,31 +826,45 @@ impl State {
                     warn!("Setting active scope to {scope} which does not exist")
                 }
             }
-            Message::AddVariable(var) => {
-                if let Some(waves) = self.waves.as_mut() {
-                    waves.add_variable(&self.sys.translators, &var);
-                    self.invalidate_draw_commands();
+            Message::AddVariables(vars) => {
+                if !vars.is_empty() {
+                    let undo_msg = if vars.len() == 1 {
+                        format!("Add variable {}", vars[0].name)
+                    } else {
+                        format!("Add {} variables", vars.len())
+                    };
+                    self.save_current_canvas(undo_msg);
+                    if let Some(waves) = self.waves.as_mut() {
+                        if let Some(cmd) = waves.add_variables(&self.sys.translators, vars) {
+                            self.load_variables(cmd);
+                        }
+                        self.invalidate_draw_commands();
+                    }
                 }
             }
             Message::AddDivider(name, vidx) => {
+                self.save_current_canvas("Add divider".into());
                 if let Some(waves) = self.waves.as_mut() {
                     waves.add_divider(name, vidx);
                 }
             }
             Message::AddTimeLine(vidx) => {
+                self.save_current_canvas("Add timeline".into());
                 if let Some(waves) = self.waves.as_mut() {
                     waves.add_timeline(vidx);
                 }
             }
             Message::AddScope(scope) => {
+                self.save_current_canvas(format!("Add scope {}", scope.name()));
+
                 let Some(waves) = self.waves.as_mut() else {
                     warn!("Adding scope without waves loaded");
                     return;
                 };
 
                 let variables = waves.inner.variables_in_scope(&scope);
-                for variable in variables {
-                    waves.add_variable(&self.sys.translators, &variable);
+                if let Some(cmd) = waves.add_variables(&self.sys.translators, variables) {
+                    self.load_variables(cmd);
                 }
                 self.invalidate_draw_commands();
             }
@@ -734,11 +885,11 @@ impl State {
                 };
 
                 let visible_items_len = waves.displayed_items.len();
-                if visible_items_len > 0 && idx < visible_items_len {
+                if visible_items_len > 0 && idx.0 < visible_items_len {
                     waves.focused_item = Some(idx);
                 } else {
                     error!(
-                        "Can not focus variable {idx} because only {visible_items_len} variables are visible.",
+                        "Can not focus variable {} because only {visible_items_len} variables are visible.", idx.0
                     );
                 }
             }
@@ -748,13 +899,17 @@ impl State {
                 };
             }
             Message::RenameItem(vidx) => {
+                self.save_current_canvas(format!(
+                    "Rename item to {}",
+                    self.sys.item_renaming_string.borrow()
+                ));
                 if let Some(waves) = self.waves.as_mut() {
                     let idx = vidx.or(waves.focused_item);
                     if let Some(idx) = idx {
                         self.rename_target = Some(idx);
                         *self.sys.item_renaming_string.borrow_mut() = waves
                             .displayed_items_order
-                            .get(idx)
+                            .get(idx.0)
                             .and_then(|id| waves.displayed_items.get(id))
                             .map(|item| item.name())
                             .unwrap_or_default();
@@ -772,15 +927,23 @@ impl State {
                         MoveDir::Up => {
                             waves.focused_item = waves
                                 .focused_item
+                                .map(|dii| dii.0)
                                 .map_or(Some(visible_items_len - 1), |focused| {
                                     Some(focused - count.clamp(0, focused))
                                 })
+                                .map(DisplayedItemIndex)
                         }
                         MoveDir::Down => {
-                            waves.focused_item = waves.focused_item.map_or(
-                                Some((count - 1).clamp(0, visible_items_len - 1)),
-                                |focused| Some((focused + count).clamp(0, visible_items_len - 1)),
-                            );
+                            waves.focused_item = waves
+                                .focused_item
+                                .map(|dii| dii.0)
+                                .map_or(
+                                    Some((count - 1).clamp(0, visible_items_len - 1)),
+                                    |focused| {
+                                        Some((focused + count).clamp(0, visible_items_len - 1))
+                                    },
+                                )
+                                .map(DisplayedItemIndex);
                         }
                     }
                 }
@@ -816,17 +979,30 @@ impl State {
                 }
             }
             Message::RemoveItem(idx, count) => {
+                let name = self
+                    .waves
+                    .as_ref()
+                    .and_then(|waves| {
+                        waves
+                            .displayed_items_order
+                            .get(idx.0)
+                            .and_then(|id| waves.displayed_items.get(id))
+                            .map(|item| item.name())
+                    })
+                    .unwrap_or("".to_string());
+                self.save_current_canvas(format!("Remove item {}", name));
                 if let Some(waves) = self.waves.as_mut() {
                     waves.remove_displayed_item(count, idx);
                     self.invalidate_draw_commands();
                 }
             }
             Message::MoveFocusedItem(direction, count) => {
+                self.save_current_canvas(format!("Move item {}, {}", direction, count));
                 self.invalidate_draw_commands();
                 let Some(waves) = self.waves.as_mut() else {
                     return;
                 };
-                if let Some(idx) = waves.focused_item {
+                if let Some(DisplayedItemIndex(idx)) = waves.focused_item {
                     let visible_items_len = waves.displayed_items.len();
                     if visible_items_len > 0 {
                         match direction {
@@ -838,13 +1014,13 @@ impl State {
                                     .rev()
                                 {
                                     waves.displayed_items_order.swap(i, i - 1);
-                                    waves.focused_item = Some(i - 1);
+                                    waves.focused_item = Some((i - 1).into());
                                 }
                             }
                             MoveDir::Down => {
                                 for i in idx..(idx + count).clamp(0, visible_items_len - 1) {
                                     waves.displayed_items_order.swap(i, i + 1);
-                                    waves.focused_item = Some(i + 1);
+                                    waves.focused_item = Some((i + 1).into());
                                 }
                             }
                         }
@@ -922,55 +1098,57 @@ impl State {
                     self.invalidate_draw_commands();
                 }
             }
-            Message::VariableFormatChange(field, format) => {
+            Message::VariableFormatChange(displayed_field_ref, format) => {
                 let Some(waves) = self.waves.as_mut() else {
                     return;
                 };
-
-                if self
+                if !self
                     .sys
                     .translators
                     .all_translator_names()
                     .contains(&&format)
                 {
-                    *waves.variable_format.entry(field.clone()).or_default() = format;
-
-                    if field.field.is_empty() {
-                        let Ok(meta) = waves
-                            .inner
-                            .variable_meta(&field.root)
-                            .map_err(|e| warn!("{e:#?}"))
-                        else {
-                            return;
-                        };
-                        let translator = waves.variable_translator(&field, &self.sys.translators);
-                        let new_info = translator.variable_info(&meta).unwrap();
-
-                        for id in &waves.displayed_items_order {
-                            waves
-                                .displayed_items
-                                .entry(*id)
-                                .and_modify(|item| match item {
-                                    DisplayedItem::Variable(disp) => {
-                                        if disp.variable_ref == field.root {
-                                            disp.info = new_info.clone();
-                                        }
-                                    }
-                                    DisplayedItem::Marker(_) => {}
-                                    DisplayedItem::Divider(_) => {}
-                                    DisplayedItem::TimeLine(_) => {}
-                                    DisplayedItem::Placeholder(_) => {}
-                                });
-                        }
-                    }
-                    self.invalidate_draw_commands();
-                } else {
-                    warn!("No translator {format}")
+                    warn!("No translator {format}");
+                    return;
                 }
+
+                let Some(DisplayedItem::Variable(displayed_variable)) =
+                    waves.displayed_items.get_mut(&displayed_field_ref.item)
+                else {
+                    return;
+                };
+
+                if displayed_field_ref.field.is_empty() {
+                    let Ok(meta) = waves
+                        .inner
+                        .variable_meta(&displayed_variable.variable_ref)
+                        .map_err(|e| warn!("{e:#?}"))
+                    else {
+                        return;
+                    };
+                    let translator = self.sys.translators.get_translator(&format);
+                    let new_info = translator.variable_info(&meta).unwrap();
+
+                    displayed_variable.format = Some(format);
+                    displayed_variable.info = new_info;
+                } else {
+                    displayed_variable
+                        .field_formats
+                        .retain(|ff| ff.field != displayed_field_ref.field);
+                    displayed_variable.field_formats.push(FieldFormat {
+                        field: displayed_field_ref.field,
+                        format,
+                    });
+                }
+                self.invalidate_draw_commands();
             }
             Message::ItemColorChange(vidx, color_name) => {
+                self.save_current_canvas(format!(
+                    "Change item color to {}",
+                    color_name.clone().unwrap_or("default".into())
+                ));
                 if let Some(waves) = self.waves.as_mut() {
-                    if let Some(idx) = vidx.or(waves.focused_item) {
+                    if let Some(DisplayedItemIndex(idx)) = vidx.or(waves.focused_item) {
                         waves.displayed_items_order.get(idx).map(|id| {
                             waves
                                 .displayed_items
@@ -981,8 +1159,12 @@ impl State {
                 };
             }
             Message::ItemNameChange(vidx, name) => {
+                self.save_current_canvas(format!(
+                    "Change item name to {}",
+                    name.clone().unwrap_or("default".into())
+                ));
                 if let Some(waves) = self.waves.as_mut() {
-                    if let Some(idx) = vidx.or(waves.focused_item) {
+                    if let Some(DisplayedItemIndex(idx)) = vidx.or(waves.focused_item) {
                         waves.displayed_items_order.get(idx).map(|id| {
                             waves
                                 .displayed_items
@@ -993,8 +1175,12 @@ impl State {
                 };
             }
             Message::ItemBackgroundColorChange(vidx, color_name) => {
+                self.save_current_canvas(format!(
+                    "Change item background color to {}",
+                    color_name.clone().unwrap_or("default".into())
+                ));
                 if let Some(waves) = self.waves.as_mut() {
-                    if let Some(idx) = vidx.or(waves.focused_item) {
+                    if let Some(DisplayedItemIndex(idx)) = vidx.or(waves.focused_item) {
                         waves.displayed_items_order.get(idx).map(|id| {
                             waves
                                 .displayed_items
@@ -1014,17 +1200,13 @@ impl State {
                     // start of visible area transition for next transition
                     // end of visible area for previous transition
                     if waves.cursor.is_none() && waves.focused_item.is_some() {
-                        let num_timestamps = waves.num_timestamps();
-                        if next {
-                            waves
-                                .viewports
-                                .first()
-                                .map(|vp| waves.cursor = Some(vp.left_edge_time(&num_timestamps)));
-                        } else {
-                            waves
-                                .viewports
-                                .first()
-                                .map(|vp| waves.cursor = Some(vp.right_edge_time(&num_timestamps)));
+                        if let Some(vp) = waves.viewports.first() {
+                            let num_timestamps = waves.num_timestamps();
+                            waves.cursor = if next {
+                                Some(vp.left_edge_time(&num_timestamps))
+                            } else {
+                                Some(vp.right_edge_time(&num_timestamps))
+                            };
                         }
                     }
                     waves.set_cursor_at_transition(next, variable, skip_zero);
@@ -1034,9 +1216,19 @@ impl State {
                     }
                 }
             }
-            Message::ResetVariableFormat(idx) => {
-                if let Some(waves) = self.waves.as_mut() {
-                    waves.variable_format.remove(&idx);
+            Message::ResetVariableFormat(displayed_field_ref) => {
+                if let Some(DisplayedItem::Variable(displayed_variable)) = self
+                    .waves
+                    .as_mut()
+                    .and_then(|waves| waves.displayed_items.get_mut(&displayed_field_ref.item))
+                {
+                    if displayed_field_ref.field.is_empty() {
+                        displayed_variable.format = None;
+                    } else {
+                        displayed_variable
+                            .field_formats
+                            .retain(|ff| ff.field != displayed_field_ref.field);
+                    }
                     self.invalidate_draw_commands();
                 }
             }
@@ -1054,26 +1246,111 @@ impl State {
                 self.load_wave_from_file(filename, load_options).ok();
             }
             Message::LoadWaveformFileFromUrl(url, load_options) => {
-                self.load_vcd_from_url(url, load_options);
+                self.load_wave_from_url(url, load_options);
             }
             Message::LoadWaveformFileFromData(data, load_options) => {
-                self.load_vcd_from_data(data, load_options).ok();
+                self.load_wave_from_data(data, load_options).ok();
             }
             #[cfg(not(target_arch = "wasm32"))]
             Message::ConnectToCxxrtl(url) => self.connect_to_cxxrtl(url, false),
+            Message::SurferServerStatus(_start, server, status) => {
+                self.server_status_to_progress(server, status);
+            }
             Message::FileDropped(dropped_file) => {
-                self.load_vcd_from_dropped(dropped_file)
+                self.load_wave_from_dropped(dropped_file)
                     .map_err(|e| error!("{e:#?}"))
                     .ok();
             }
+            Message::WaveHeaderLoaded(start, source, load_options, header) => {
+                // for files using the `wellen` backend, we load the header before parsing the body
+                info!(
+                    "Loaded the hierarchy and meta-data of {source} in {:?}",
+                    start.elapsed()
+                );
+                match header {
+                    HeaderResult::Local(header) => {
+                        // register waveform as loaded (but with no variable info yet!)
+                        let shared_hierarchy = Arc::new(header.hierarchy);
+                        let new_waves =
+                            Box::new(WaveContainer::new_waveform(shared_hierarchy.clone()));
+                        self.on_waves_loaded(
+                            source.clone(),
+                            convert_format(header.file_format),
+                            new_waves,
+                            load_options,
+                        );
+                        // start parsing of the body
+                        self.load_wave_body(source, header.body, header.body_len, shared_hierarchy);
+                    }
+                    HeaderResult::Remote(hierarchy, file_format, server) => {
+                        // register waveform as loaded (but with no variable info yet!)
+                        let new_waves = Box::new(WaveContainer::new_remote_waveform(
+                            server.clone(),
+                            hierarchy.clone(),
+                        ));
+                        self.on_waves_loaded(
+                            source.clone(),
+                            convert_format(file_format),
+                            new_waves,
+                            load_options,
+                        );
+                        // body is already being parsed on the server, we need to request the time table though
+                        Self::get_time_table_from_server(
+                            self.sys.channels.msg_sender.clone(),
+                            server,
+                        );
+                    }
+                }
+            }
+            Message::WaveBodyLoaded(start, source, body) => {
+                // for files using the `wellen` backend, parse the body in a second step
+                info!("Loaded the body of {source} in {:?}", start.elapsed());
+                self.sys.progress_tracker = None;
+                let waves = self
+                    .waves
+                    .as_mut()
+                    .expect("Waves should be loaded at this point!");
+                // add source and time table
+                let maybe_cmd = waves.inner.wellen_add_body(body).unwrap_or_else(|err| {
+                    error!("{err:?}");
+                    None
+                });
+                // update viewports, now that we have the time table
+                waves.update_viewports();
+                // make sure we redraw
+                self.invalidate_draw_commands();
+                // start loading variables
+                if let Some(cmd) = maybe_cmd {
+                    self.load_variables(cmd);
+                }
+            }
+            Message::SignalsLoaded(start, res) => {
+                info!("Loaded {} variables in {:?}", res.len(), start.elapsed());
+                self.sys.progress_tracker = None;
+                let waves = self
+                    .waves
+                    .as_mut()
+                    .expect("Waves should be loaded at this point!");
+                match waves.inner.on_signals_loaded(res) {
+                    Err(err) => error!("{err:?}"),
+                    Ok(Some(cmd)) => self.load_variables(cmd),
+                    _ => {}
+                }
+                // make sure we redraw since now more variable data is available
+                self.invalidate_draw_commands();
+            }
             Message::WavesLoaded(filename, format, new_waves, load_options) => {
-                self.on_waves_loaded(filename, format, new_waves, load_options)
+                self.on_waves_loaded(filename, format, new_waves, load_options);
+                // here, the body and thus the number of timestamps is already loaded!
+                self.waves.as_mut().unwrap().update_viewports();
+                self.sys.progress_tracker = None;
             }
             Message::BlacklistTranslator(idx, translator) => {
                 self.blacklisted_translators.insert((idx, translator));
             }
             Message::Error(e) => {
-                error!("{e:?}")
+                error!("{e:?}");
+                self.show_logs = true;
             }
             Message::TranslatorLoaded(t) => {
                 info!("Translator {} loaded", t.name());
@@ -1128,12 +1405,23 @@ impl State {
                 };
                 self.show_overview = Some(new)
             }
+            Message::ToggleDirection => {
+                let new = match self.show_variable_direction {
+                    Some(prev) => !prev,
+                    None => !self.config.layout.show_variable_direction(),
+                };
+                self.show_variable_direction = Some(new)
+            }
             Message::ToggleIndices => {
                 let new = match self.show_variable_indices {
                     Some(prev) => !prev,
                     None => !self.config.layout.show_variable_indices(),
                 };
-                self.show_variable_indices = Some(new)
+                self.show_variable_indices = Some(new);
+                if let Some(waves) = self.waves.as_mut() {
+                    waves.display_variable_indices = new;
+                    waves.compute_variable_display_names();
+                }
             }
             Message::ShowCommandPrompt(new_visibility) => {
                 if !new_visibility {
@@ -1145,19 +1433,14 @@ impl State {
                 self.sys.command_prompt.visible = new_visibility;
             }
             Message::FileDownloaded(url, bytes, load_options) => {
-                let size = bytes.len() as u64;
-                self.load_vcd_from_bytes(
-                    WaveSource::Url(url),
-                    bytes.to_vec(),
-                    Some(size),
-                    load_options,
-                )
+                self.load_wave_from_bytes(WaveSource::Url(url), bytes.to_vec(), load_options)
             }
             Message::ReloadConfig => {
                 // FIXME think about a structured way to collect errors
                 if let Ok(config) =
                     SurferConfig::new(false).with_context(|| "Failed to load config file")
                 {
+                    self.sys.translators = all_translators();
                     self.config = config;
                     if let Some(ctx) = &self.sys.context.as_ref() {
                         ctx.set_visuals(self.get_visuals())
@@ -1175,7 +1458,6 @@ impl State {
                             LoadOptions {
                                 keep_variables: true,
                                 keep_unavailable,
-                                expect_format: Some(waves.format),
                             },
                         )
                         .ok();
@@ -1190,19 +1472,17 @@ impl State {
                                 LoadOptions {
                                     keep_variables: true,
                                     keep_unavailable,
-                                    expect_format: None,
                                 },
                             )
                             .ok()
                         });
                     }
                     WaveSource::Url(url) => {
-                        self.load_vcd_from_url(
+                        self.load_wave_from_url(
                             url.clone(),
                             LoadOptions {
                                 keep_variables: true,
                                 keep_unavailable,
-                                expect_format: None,
                             },
                         );
                     }
@@ -1221,11 +1501,13 @@ impl State {
                 self.config.default_clock_highlight_type = new_type
             }
             Message::SetMarker { id, time } => {
+                self.save_current_canvas(format!("Set marker to {time}"));
                 if let Some(waves) = self.waves.as_mut() {
                     waves.set_marker_position(id, &time)
                 };
             }
             Message::MoveMarkerToCursor(idx) => {
+                self.save_current_canvas("Move marker".into());
                 if let Some(waves) = self.waves.as_mut() {
                     waves.move_marker_to_cursor(idx);
                 };
@@ -1244,7 +1526,7 @@ impl State {
                     return;
                 };
                 // checks if vidx is Some then use that, else try focused variable
-                if let Some(idx) = vidx.or(waves.focused_item) {
+                if let Some(DisplayedItemIndex(idx)) = vidx.or(waves.focused_item) {
                     if waves.displayed_items.len() > idx {
                         let id = waves.displayed_items_order[idx];
                         let mut recompute_names = false;
@@ -1284,6 +1566,12 @@ impl State {
                     } else {
                         0
                     };
+                self.sys.command_prompt.new_selection =
+                    Some(if self.sys.command_prompt_text.borrow().is_empty() {
+                        self.sys.command_prompt.previous_commands.len().clamp(0, 3)
+                    } else {
+                        0
+                    });
             }
             Message::CommandPromptPushPrevious(cmd) => {
                 let len = cmd.len();
@@ -1295,9 +1583,8 @@ impl State {
             Message::OpenFileDialog(mode) => {
                 self.open_file_dialog(mode);
             }
-            Message::OpenSaveStateDialog => {
-                self.open_state_save_dialog();
-            }
+            Message::SaveStateFile(path) => self.save_state_file(path),
+            Message::SetStateFile(path) => self.state_file = Some(path),
             Message::SetAboutVisible(s) => self.show_about = s,
             Message::SetKeyHelpVisible(s) => self.show_keys = s,
             Message::SetGestureHelpVisible(s) => self.show_gestures = s,
@@ -1326,18 +1613,24 @@ impl State {
                 }
                 self.ui_zoom_factor = Some(scale)
             }
-            Message::SaveState(filename) => {
-                self.save_state(&filename);
-            }
             Message::SelectPrevCommand => {
-                self.sys.command_prompt.selected =
-                    self.sys.command_prompt.selected.saturating_sub(1);
+                self.sys.command_prompt.new_selection = self
+                    .sys
+                    .command_prompt
+                    .new_selection
+                    .or(Some(self.sys.command_prompt.selected))
+                    .map(|idx| idx.saturating_sub(1).max(0));
             }
             Message::SelectNextCommand => {
-                self.sys.command_prompt.selected = std::cmp::min(
-                    self.sys.command_prompt.selected + 1,
-                    self.sys.command_prompt.suggestions.len().saturating_sub(1),
-                );
+                self.sys.command_prompt.new_selection = self
+                    .sys
+                    .command_prompt
+                    .new_selection
+                    .or(Some(self.sys.command_prompt.selected))
+                    .map(|idx| {
+                        idx.saturating_add(1)
+                            .min(self.sys.command_prompt.suggestions.len().saturating_sub(1))
+                    });
             }
             Message::SetHierarchyStyle(style) => self.config.layout.hierarchy_style = style,
             Message::SetArrowKeyBindings(bindings) => {
@@ -1359,19 +1652,59 @@ impl State {
                     self.update(message)
                 }
             }
+            Message::VariableDragStarted(vidx) => {
+                self.drag_started = true;
+                self.drag_source_idx = Some(vidx);
+                self.drag_target_idx = None;
+            }
+            Message::VariableDragTargetChanged(vidx) => {
+                self.drag_target_idx = Some(vidx);
+            }
+            Message::VariableDragFinished => {
+                self.drag_started = false;
+
+                // reordering
+                if let (
+                    Some(DisplayedItemIndex(source_vidx)),
+                    Some(DisplayedItemIndex(target_vidx)),
+                ) = (self.drag_source_idx, self.drag_target_idx)
+                {
+                    self.save_current_canvas("Drag item".to_string());
+                    self.invalidate_draw_commands();
+                    let Some(waves) = self.waves.as_mut() else {
+                        return;
+                    };
+                    let visible_items_len = waves.displayed_items.len();
+                    if visible_items_len > 0 {
+                        let old_idx = waves.displayed_items_order.remove(source_vidx);
+                        if waves.displayed_items_order.len() < target_vidx {
+                            waves.displayed_items_order.push(old_idx);
+                        } else {
+                            waves.displayed_items_order.insert(target_vidx, old_idx);
+                        }
+
+                        // carry focused item when moving it
+                        if waves.focused_item.is_some_and(|f| f.0 == source_vidx) {
+                            waves.focused_item = Some(target_vidx.into());
+                        }
+                    }
+                }
+                self.drag_source_idx = None;
+                self.drag_target_idx = None;
+            }
             Message::VariableValueToClipbord(vidx) => {
                 if let Some(waves) = &self.waves {
-                    if let Some(vidx) = vidx.or(waves.focused_item) {
-                        if let Some(DisplayedItem::Variable(displayed_variable)) = waves
+                    if let Some(DisplayedItemIndex(vidx)) = vidx.or(waves.focused_item) {
+                        if let Some(DisplayedItem::Variable(_displayed_variable)) = waves
                             .displayed_items_order
                             .get(vidx)
                             .and_then(|id| waves.displayed_items.get(id))
                         {
-                            let path =
-                                FieldRef::without_fields(displayed_variable.variable_ref.clone());
+                            let field_ref =
+                                (*waves.displayed_items_order.get(vidx).unwrap()).into();
                             let variable_value = self.get_variable_value(
                                 waves,
-                                &path,
+                                &field_ref,
                                 &waves.cursor.as_ref().and_then(|u| u.to_biguint()),
                             );
                             if let Some(variable_value) = variable_value {
@@ -1381,6 +1714,42 @@ impl State {
                             }
                         }
                     }
+                }
+            }
+            Message::Undo(count) => {
+                if let Some(waves) = &mut self.waves {
+                    for _ in 0..count {
+                        if let Some(prev_state) = self.sys.undo_stack.pop() {
+                            self.sys
+                                .redo_stack
+                                .push(State::current_canvas_state(waves, prev_state.message));
+                            waves.focused_item = prev_state.focused_item;
+                            waves.displayed_items_order = prev_state.displayed_item_order;
+                            waves.displayed_items = prev_state.displayed_items;
+                            waves.markers = prev_state.markers;
+                        } else {
+                            break;
+                        }
+                    }
+                    self.invalidate_draw_commands();
+                }
+            }
+            Message::Redo(count) => {
+                if let Some(waves) = &mut self.waves {
+                    for _ in 0..count {
+                        if let Some(prev_state) = self.sys.redo_stack.pop() {
+                            self.sys
+                                .undo_stack
+                                .push(State::current_canvas_state(waves, prev_state.message));
+                            waves.focused_item = prev_state.focused_item;
+                            waves.displayed_items_order = prev_state.displayed_item_order;
+                            waves.displayed_items = prev_state.displayed_items;
+                            waves.markers = prev_state.markers;
+                        } else {
+                            break;
+                        }
+                    }
+                    self.invalidate_draw_commands();
                 }
             }
             Message::Exit | Message::ToggleFullscreen => {} // Handled in eframe::update
@@ -1396,6 +1765,16 @@ impl State {
                     if waves.viewports.len() > 1 {
                         waves.viewports.pop();
                         self.sys.draw_data.borrow_mut().pop();
+                    }
+                }
+            }
+            Message::SelectTheme(theme_name) => {
+                if let Ok(theme) =
+                    SurferTheme::new(theme_name).with_context(|| "Failed to set theme")
+                {
+                    self.config.theme = theme;
+                    if let Some(ctx) = &self.sys.context.as_ref() {
+                        ctx.set_visuals(self.get_visuals());
                     }
                 }
             }
@@ -1438,17 +1817,18 @@ impl State {
                 displayed_items_order: vec![],
                 displayed_items: HashMap::new(),
                 viewports,
-                variable_format: HashMap::new(),
                 cursor: None,
                 right_cursor: None,
                 markers: HashMap::new(),
                 focused_item: None,
                 default_variable_name_type: self.config.default_variable_name_type,
+                display_variable_indices: self.show_variable_indices(),
                 scroll_offset: 0.,
                 drawing_infos: vec![],
                 top_item_draw_offset: 0.,
                 total_height: 0.,
                 display_item_ref_counter: 0,
+                old_num_timestamps: None,
             }
         };
         self.invalidate_draw_commands();
@@ -1456,9 +1836,6 @@ impl State {
         // Set time unit to the file time unit before consuming new_wave
         self.wanted_timeunit = new_wave.inner.metadata().timescale.unit;
         self.waves = Some(new_wave);
-        self.sys.vcd_progress = None;
-        info!("Done setting up VCD file");
-        self.run_startup_commands();
     }
 
     fn handle_async_messages(&mut self) {
@@ -1477,6 +1854,33 @@ impl State {
         while let Some(msg) = msgs.pop() {
             self.update(msg);
         }
+    }
+
+    /// After user messages are addressed, we try to execute batch commands as they are ready to run
+    fn handle_batch_commands(&mut self) {
+        // we only execute commands while we aren't waiting for background operations to complete
+        while self.can_start_batch_command() {
+            if let Some(cmd) = self.sys.batch_commands.pop_front() {
+                info!("Applying startup command: {cmd:?}");
+                self.update(cmd);
+            } else {
+                break; // no more messages
+            }
+        }
+
+        // if there are no messages and all operations have completed, we are done
+        if !self.sys.batch_commands_completed
+            && self.sys.batch_commands.is_empty()
+            && self.can_start_batch_command()
+        {
+            self.sys.batch_commands_completed = true;
+        }
+    }
+
+    /// Returns whether it is OK to start a new batch command.
+    fn can_start_batch_command(&self) -> bool {
+        // if the progress tracker is none -> all operations have completed
+        self.sys.progress_tracker.is_none()
     }
 
     pub fn get_visuals(&self) -> Visuals {
@@ -1524,14 +1928,44 @@ impl State {
         }
     }
 
-    pub fn run_startup_commands(&mut self) {
-        let startup_commands = &self.sys.startup_commands;
-        trace!("Parsing startup commands {:?}", startup_commands);
-        let parsed = startup_commands
-            .clone()
-            .drain(0..(startup_commands.len()))
+    fn encode_state(&self) -> Option<String> {
+        let opt = ron::Options::default();
+        opt.to_string_pretty(self, PrettyConfig::default())
+            .context("Failed to encode state")
+            .map_err(|e| error!("Failed to encode state. {e:#?}"))
+            .ok()
+    }
+
+    /// Returns true if the waveform and all requested signals have been loaded.
+    /// Used for testing to make sure the GUI is at its final state before taking a
+    /// snapshot.
+    pub fn waves_fully_loaded(&self) -> bool {
+        self.waves
+            .as_ref()
+            .map(|w| w.inner.is_fully_loaded())
+            .unwrap_or(false)
+    }
+
+    /// Returns true once all batch commands have been completed and their effects are all executed.
+    pub fn batch_commands_completed(&self) -> bool {
+        debug_assert!(
+            self.sys.batch_commands_completed || !self.sys.batch_commands.is_empty(),
+            "completed implies no commands"
+        );
+        self.sys.batch_commands_completed
+    }
+
+    fn parse_startup_commands<I: IntoIterator<Item = String>>(&mut self, cmds: I) -> Vec<Message> {
+        trace!("Parsing startup commands");
+        let parsed = cmds
+            .into_iter()
             // Add line numbers
             .enumerate()
+            // trace
+            .map(|(no, line)| {
+                trace!("{no: >2} {line}");
+                (no, line)
+            })
             // Make the line numbers start at 1 as is tradition
             .map(|(no, line)| (no + 1, line))
             .map(|(no, line)| (no, line.trim().to_string()))
@@ -1549,32 +1983,35 @@ impl State {
                         error!("Error on startup commands line {no}: {e:#?}");
                         e
                     })
-                    .map(|message| (message, command))
                     .ok()
             })
             .collect::<Vec<_>>();
 
-        for (message, message_string) in parsed {
-            info!("Applying message {message_string}");
-            self.update(message)
+        parsed
+    }
+
+    /// Returns the current canvas state
+    fn current_canvas_state(waves: &WaveData, message: String) -> CanvasState {
+        CanvasState {
+            message,
+            focused_item: waves.focused_item,
+            displayed_item_order: waves.displayed_items_order.clone(),
+            displayed_items: waves.displayed_items.clone(),
+            markers: waves.markers.clone(),
         }
     }
 
-    fn encode_state(&self) -> Option<String> {
-        let opt = ron::Options::default();
-        opt.to_string_pretty(self, PrettyConfig::default())
-            .context("Failed to encode state")
-            .map_err(|e| error!("Failed to encode state. {e:#?}"))
-            .ok()
-    }
+    /// Push the current canvas state to the undo stack
+    fn save_current_canvas(&mut self, message: String) {
+        if let Some(waves) = &self.waves {
+            self.sys
+                .undo_stack
+                .push(State::current_canvas_state(waves, message));
 
-    fn save_state(&self, filename: &Path) {
-        let filename_str = filename.to_string_lossy();
-        self.encode_state().and_then(|ser| {
-            std::fs::write(filename, ser)
-                .context(format!("Failed to write state to {filename_str}"))
-                .map_err(|e| error!("Failed to write state. {e:#?}"))
-                .ok()
-        });
+            if self.sys.undo_stack.len() > self.config.undo_stack_size {
+                self.sys.undo_stack.remove(0);
+            }
+            self.sys.redo_stack.clear();
+        }
     }
 }

@@ -1,7 +1,7 @@
 use color_eyre::eyre::{Context, Result};
 use color_eyre::Report;
-#[cfg(not(target_arch = "wasm32"))]
-use config::{Config, Environment, File};
+use config::builder::DefaultState;
+use config::{Config, ConfigBuilder, Environment, File};
 #[cfg(not(target_arch = "wasm32"))]
 use directories::ProjectDirs;
 use eframe::epaint::Color32;
@@ -72,6 +72,7 @@ impl From<String> for ArrowKeyBindings {
 #[derive(Debug, Deserialize)]
 pub struct SurferConfig {
     pub layout: SurferLayout,
+    #[serde(deserialize_with = "deserialize_theme")]
     pub theme: SurferTheme,
     pub gesture: SurferGesture,
     pub behavior: SurferBehavior,
@@ -84,6 +85,8 @@ pub struct SurferConfig {
     pub default_clock_highlight_type: ClockHighlightType,
     /// Distance in pixels for cursor snap
     pub snap_distance: f32,
+    /// Maximum size of the undo stack
+    pub undo_stack_size: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,9 +104,11 @@ pub struct SurferLayout {
     /// Flag to show/hide the overview
     show_overview: bool,
     /// Flag to show/hide the statusbar
-    show_statusbar: bool,
+    pub show_statusbar: bool,
     /// Flag to show/hide the indices of variables in the variable list
     show_variable_indices: bool,
+    /// Flag to show/hide the variable direction icon
+    show_variable_direction: bool,
     /// Initial window height
     pub window_height: usize,
     /// Initial window width
@@ -141,6 +146,9 @@ impl SurferLayout {
     }
     pub fn show_variable_indices(&self) -> bool {
         self.show_variable_indices
+    }
+    pub fn show_variable_direction(&self) -> bool {
+        self.show_variable_direction
     }
 }
 
@@ -208,6 +216,8 @@ pub struct SurferTheme {
     pub clock_highlight_line: SurferLineStyle,
     #[serde(deserialize_with = "deserialize_hex_color")]
     pub clock_highlight_cycle: Color32,
+    /// Draw arrows on rising clock edges
+    pub clock_rising_marker: bool,
 
     #[serde(deserialize_with = "deserialize_hex_color")]
     /// Default variable color
@@ -224,6 +234,9 @@ pub struct SurferTheme {
     #[serde(deserialize_with = "deserialize_hex_color")]
     /// Color used for weak variables
     pub variable_weak: Color32,
+    #[serde(deserialize_with = "deserialize_hex_color")]
+    /// Color used for constant variables (parameters)
+    pub variable_parameter: Color32,
     #[serde(default = "default_colors", deserialize_with = "deserialize_color_map")]
     pub colors: HashMap<String, Color32>,
 
@@ -236,6 +249,34 @@ pub struct SurferTheme {
 
     /// Viewport separator line
     pub viewport_separator: SurferLineStyle,
+
+    // drag hint and threshold parameters
+    #[serde(deserialize_with = "deserialize_hex_color")]
+    pub drag_hint_color: Color32,
+    pub drag_hint_width: f32,
+    pub drag_threshold: f32,
+    /// List of theme names
+    #[serde(default = "Vec::new")]
+    pub theme_names: Vec<String>,
+}
+
+fn get_luminance(color: &Color32) -> f32 {
+    let rg = if color.r() < 10 {
+        color.r() as f32 / 3294.0
+    } else {
+        (color.r() as f32 / 269.0 + 0.0513).powf(2.4)
+    };
+    let gg = if color.g() < 10 {
+        color.g() as f32 / 3294.0
+    } else {
+        (color.g() as f32 / 269.0 + 0.0513).powf(2.4)
+    };
+    let bg = if color.b() < 10 {
+        color.b() as f32 / 3294.0
+    } else {
+        (color.b() as f32 / 269.0 + 0.0513).powf(2.4)
+    };
+    0.2126 * rg + 0.7152 * gg + 0.0722 * bg
 }
 
 impl SurferTheme {
@@ -251,12 +292,132 @@ impl SurferTheme {
         }
         None
     }
-}
-#[derive(Debug, Deserialize)]
-pub struct ThemeColor {
-    pub name: String,
-    #[serde(deserialize_with = "deserialize_hex_color")]
-    pub color: Color32,
+
+    pub fn get_best_text_color(&self, backgroundcolor: &Color32) -> &Color32 {
+        // Based on https://ux.stackexchange.com/questions/82056/how-to-measure-the-contrast-between-any-given-color-and-white
+
+        // Compute luminance
+        let l_foreground = get_luminance(&self.foreground);
+        let l_alt_text_color = get_luminance(&self.alt_text_color);
+        let l_background = get_luminance(backgroundcolor);
+
+        // Compute contrast ratio
+        let mut cr_foreground = (l_foreground + 0.05) / (l_background + 0.05);
+        cr_foreground = cr_foreground.max(1. / cr_foreground);
+        let mut cr_alt_text_color = (l_alt_text_color + 0.05) / (l_background + 0.05);
+        cr_alt_text_color = cr_alt_text_color.max(1. / cr_alt_text_color);
+
+        // Return color with highest contrast
+        if cr_foreground > cr_alt_text_color {
+            &self.foreground
+        } else {
+            &self.alt_text_color
+        }
+    }
+
+    fn generate_defaults(
+        theme_name: &Option<String>,
+    ) -> (ConfigBuilder<DefaultState>, Vec<String>) {
+        let default_theme = String::from(include_str!("../default_theme.toml"));
+
+        let mut theme = Config::builder().add_source(config::File::from_str(
+            &default_theme,
+            config::FileFormat::Toml,
+        ));
+
+        let theme_names = vec![
+            "dark+".to_string(),
+            "light+".to_string(),
+            "solarized".to_string(),
+        ];
+
+        let override_theme = match theme_name.clone().unwrap_or("".to_string()).as_str() {
+            "dark+" => include_str!("../themes/dark+.toml"),
+            "light+" => include_str!("../themes/light+.toml"),
+            "solarized" => include_str!("../themes/solarized.toml"),
+            _ => "",
+        }
+        .to_string();
+
+        theme = theme.add_source(config::File::from_str(
+            &override_theme,
+            config::FileFormat::Toml,
+        ));
+        (theme, theme_names)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn new(theme_name: Option<String>) -> Result<Self> {
+        use color_eyre::eyre::anyhow;
+
+        let (mut theme, theme_names) = Self::generate_defaults(&theme_name);
+
+        let theme = theme.set_override(
+            "theme_names",
+            vec![
+                "dark+".to_string(),
+                "light+".to_string(),
+                "solarized".to_string(),
+            ],
+        )?;
+
+        theme
+            .build()?
+            .try_deserialize()
+            .map_err(|e| anyhow!("Failed to parse config {e}"))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new(theme_name: Option<String>) -> color_eyre::Result<Self> {
+        use color_eyre::eyre::anyhow;
+
+        let (mut theme, mut theme_names) = Self::generate_defaults(&theme_name);
+
+        if let Some(proj_dirs) = ProjectDirs::from("org", "surfer-project", "surfer") {
+            let theme_dir = proj_dirs.config_dir().join("themes");
+            let entries = std::fs::read_dir(theme_dir);
+
+            if let Ok(entries) = entries {
+                for entry in entries.flatten() {
+                    if entry
+                        .file_name()
+                        .into_string()
+                        .is_ok_and(|file_name| file_name.ends_with(".toml"))
+                    {
+                        let fname = entry
+                            .file_name()
+                            .into_string()
+                            .unwrap()
+                            .strip_suffix(".toml")
+                            .unwrap_or("")
+                            .to_string();
+                        if !fname.is_empty() && !theme_names.contains(&fname) {
+                            theme_names.push(fname);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !theme_name.clone().unwrap_or("".to_string()).is_empty() {
+            if let Some(proj_dirs) = ProjectDirs::from("org", "surfer-project", "surfer") {
+                let theme_file = proj_dirs
+                    .config_dir()
+                    .join("themes/")
+                    .join(theme_name.unwrap())
+                    .with_extension("toml");
+
+                theme = theme.add_source(File::from(theme_file).required(false));
+            }
+        }
+
+        let theme = theme.set_override("theme_names", theme_names)?;
+
+        theme
+            .build()?
+            .try_deserialize()
+            .map_err(|e| anyhow!("Failed to parse theme {e}"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,23 +471,26 @@ impl SurferConfig {
 
         let default_config = String::from(include_str!("../default_config.toml"));
 
-        let mut c = Config::builder().add_source(config::File::from_str(
+        let mut config = Config::builder().add_source(config::File::from_str(
             &default_config,
             config::FileFormat::Toml,
         ));
-        let c = if !force_default_config {
+
+        let config = if !force_default_config {
             if let Some(proj_dirs) = ProjectDirs::from("org", "surfer-project", "surfer") {
                 let config_file = proj_dirs.config_dir().join("config.toml");
-                c = c.add_source(File::from(config_file).required(false));
+                config = config.add_source(File::from(config_file).required(false));
             }
 
-            c.add_source(File::from(Path::new("surfer.toml")).required(false))
+            config
+                .add_source(File::from(Path::new("surfer.toml")).required(false))
                 .add_source(Environment::with_prefix("surfer"))
         } else {
-            c
+            config
         };
 
-        c.build()?
+        config
+            .build()?
             .try_deserialize()
             .map_err(|e| anyhow!("Failed to parse config {e}"))
     }
@@ -380,4 +544,12 @@ where
 
     let v = HashMap::<String, Wrapper>::deserialize(deserializer)?;
     Ok(v.into_iter().map(|(k, Wrapper(v))| (k, v)).collect())
+}
+
+fn deserialize_theme<'de, D>(deserializer: D) -> Result<SurferTheme, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let buf = String::deserialize(deserializer)?;
+    SurferTheme::new(Some(buf)).map_err(de::Error::custom)
 }

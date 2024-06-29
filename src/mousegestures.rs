@@ -1,6 +1,6 @@
 use eframe::egui::{Context, Painter, PointerButton, Response, RichText, Sense, Window};
-use eframe::emath::{Align2, RectTransform};
-use eframe::epaint::{FontId, Pos2, Rect, Stroke, Vec2};
+use eframe::emath::{Align2, Pos2, Rect, RectTransform, Vec2};
+use eframe::epaint::{FontId, Stroke};
 
 use crate::config::SurferTheme;
 use crate::time::time_string;
@@ -99,12 +99,12 @@ impl State {
                             };
                             msgs.push(Message::ZoomToRange {
                                 // FIXME: No need to go via bigint here, this could all be relative
-                                start: waves.viewports[viewport_idx].to_time_bigint(
+                                start: waves.viewports[viewport_idx].as_time_bigint(
                                     minx,
                                     frame_width,
                                     &waves.num_timestamps(),
                                 ),
-                                end: waves.viewports[viewport_idx].to_time_bigint(
+                                end: waves.viewports[viewport_idx].as_time_bigint(
                                     maxx,
                                     frame_width,
                                     &waves.num_timestamps(),
@@ -211,7 +211,7 @@ impl State {
             format!(
                 "Zoom in: {} to {}",
                 time_string(
-                    &(waves.viewports[viewport_idx].to_time_bigint(
+                    &(waves.viewports[viewport_idx].as_time_bigint(
                         minx,
                         width,
                         &waves.num_timestamps()
@@ -221,7 +221,7 @@ impl State {
                     &self.get_time_format()
                 ),
                 time_string(
-                    &(waves.viewports[viewport_idx].to_time_bigint(
+                    &(waves.viewports[viewport_idx].as_time_bigint(
                         maxx,
                         width,
                         &waves.num_timestamps()
@@ -424,23 +424,21 @@ fn gesture_type(start_location: Pos2, end_location: Pos2) -> Option<GestureKind>
             // South
             None
         }
+    } else if delta.x * tan225 > delta.y.abs() {
+        // East
+        Some(GestureKind::ZoomIn)
+    } else if delta.y < 0.0 && delta.x > -delta.y * tan225 {
+        // North east
+        Some(GestureKind::ZoomOut)
+    } else if delta.y > 0.0 && delta.x > delta.y * tan225 {
+        // South east
+        Some(GestureKind::GoToEnd)
+    // } else if delta.y > 0.0 {
+    //    // North
+    //    None
     } else {
-        if delta.x * tan225 > delta.y.abs() {
-            // East
-            Some(GestureKind::ZoomIn)
-        } else if delta.y < 0.0 && delta.x > -delta.y * tan225 {
-            // North east
-            Some(GestureKind::ZoomOut)
-        } else if delta.y > 0.0 && delta.x > delta.y * tan225 {
-            // South east
-            Some(GestureKind::GoToEnd)
-        // } else if delta.y > 0.0 {
-        //    // North
-        //    None
-        } else {
-            // South
-            None
-        }
+        // South
+        None
     }
 }
 

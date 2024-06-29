@@ -14,8 +14,10 @@ impl State {
 
     #[inline]
     pub fn show_statusbar(&self) -> bool {
-        self.show_statusbar
-            .unwrap_or_else(|| self.config.layout.show_statusbar())
+        self.show_statusbar.unwrap_or_else(|| {
+            (self.waves.is_some() || self.sys.progress_tracker.is_some())
+                && self.config.layout.show_statusbar()
+        })
     }
 
     #[inline]
@@ -58,5 +60,10 @@ impl State {
     pub fn show_variable_indices(&self) -> bool {
         self.show_variable_indices
             .unwrap_or_else(|| self.config.layout.show_variable_indices())
+    }
+    #[inline]
+    pub fn show_variable_direction(&self) -> bool {
+        self.show_variable_direction
+            .unwrap_or_else(|| self.config.layout.show_variable_direction())
     }
 }

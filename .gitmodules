@@ -7,9 +7,9 @@
 [submodule "f128"]
 	path = f128
 	url = https://github.com/jkarns275/f128.git
-[submodule "waveform"]
-	path = wellen
-	url = https://github.com/ekiwi/waveform-rust.git
+[submodule "instruction-decoder"]
+	path = instruction-decoder
+	url = https://github.com/ics-jku/instruction-decoder.git
 [submodule "tywaves-rs"]
 	path = tywaves-rs
 	url = https://github.com/rameloni/tywaves-rs

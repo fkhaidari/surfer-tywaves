@@ -1,6 +1,6 @@
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
+    rev: v4.6.0
     hooks:
     - id: check-yaml
     - id: end-of-file-fixer
@@ -11,7 +11,7 @@ repos:
     - id: check-json
     - id: pretty-format-json
   - repo: https://github.com/crate-ci/typos
-    rev: v1.17.0
+    rev: v1.22.7
     hooks:
     - id: typos
       args: []
@@ -23,9 +23,11 @@ repos:
     rev: v1.0
     hooks:
     - id: fmt
+      types: ["rust"]
     - id: cargo-check
+      types: ["rust"]
   - repo: https://github.com/shssoichiro/oxipng
-    rev: v9.0.0
+    rev: v9.1.1
     hooks:
     - id: oxipng
   - repo: local
@@ -35,3 +37,4 @@ repos:
         entry: cargo test
         language: system
         pass_filenames: false
+        types_or: ["rust", "png", "toml"]

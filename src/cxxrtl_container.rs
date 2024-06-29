@@ -17,6 +17,7 @@ use log::{error, info, trace, warn};
 use num::{bigint::ToBigInt, BigUint};
 use serde::Deserialize;
 
+use crate::wave_container::VariableEncoding;
 use crate::{
     cxxrtl::{
         command::{CxxrtlCommand, Diagnostic},
@@ -72,15 +73,12 @@ impl CxxrtlWorker {
         loop {
             tokio::select! {
                 rx = self.command_channel.recv() => {
-                    match rx {
-                        Some((command, callback)) => {
-                            if let Err(e) =  self.send_message(CSMessage::command(command)).await {
+                    if let Some((command, callback)) = rx {
+                        if let Err(e) =  self.send_message(CSMessage::command(command)).await {
                                 error!("Failed to send message {e:#?}")
                             } else {
                                 self.callback_queue.push_back(callback)
                             }
-                        }
-                        None => {}
                     }
                 }
                 count = self.stream.read(&mut buf) => {
@@ -107,7 +105,7 @@ impl CxxrtlWorker {
 
     async fn send_message(&mut self, message: CSMessage) -> Result<()> {
         let encoded = serde_json::to_string(&message)
-            .with_context(|| format!("Failed to encode greeting message"))?;
+            .with_context(|| "Failed to encode greeting message".to_string())?;
         self.stream.write_all(encoded.as_bytes()).await?;
         self.stream.write_all(&[b'\0']).await?;
 
@@ -122,11 +120,9 @@ impl CxxrtlWorker {
                 if let Some(cb) = self.callback_queue.pop_front() {
                     let mut w = self.data.write().await;
                     cb(r, &mut w);
-                    crate::EGUI_CONTEXT
-                        .read()
-                        .unwrap()
-                        .as_ref()
-                        .map(|ctx| ctx.request_repaint());
+                    if let Some(ctx) = crate::EGUI_CONTEXT.read().unwrap().as_ref() {
+                        ctx.request_repaint()
+                    }
                 } else {
                     warn!("Received a response ({r:?}) without a corresponding callback")
                 }
@@ -152,11 +148,9 @@ impl CxxrtlWorker {
                             }))
                     }
                 }
-                crate::EGUI_CONTEXT
-                    .read()
-                    .unwrap()
-                    .as_ref()
-                    .map(|ctx| ctx.request_repaint());
+                if let Some(ctx) = crate::EGUI_CONTEXT.read().unwrap().as_ref() {
+                    ctx.request_repaint()
+                }
             }
         }
     }
@@ -300,7 +294,7 @@ impl CxxrtlContainer {
         info!("Done setting up TCP stream");
 
         let greeting = serde_json::to_string(&CSMessage::greeting { version: 0 })
-            .with_context(|| format!("Failed to encode greeting message"))?;
+            .with_context(|| "Failed to encode greeting message".to_string())?;
         stream.write_all(greeting.as_bytes())?;
         stream.write_all(&[b'\0'])?;
 
@@ -444,7 +438,7 @@ impl CxxrtlContainer {
                 let sp = k.split(' ').collect::<Vec<_>>();
 
                 if sp.is_empty() {
-                    error!("Found an empty signal name and scope");
+                    error!("Found an empty variable name and scope");
                     None
                 } else {
                     Some((
@@ -518,11 +512,11 @@ impl CxxrtlContainer {
             .unwrap_or_default()
     }
 
-    pub fn signals_in_module(&mut self, module: &ScopeRef) -> Vec<VariableRef> {
+    pub fn variables_in_module(&mut self, module: &ScopeRef) -> Vec<VariableRef> {
         self.fetch_items_in_module(module).keys().cloned().collect()
     }
 
-    pub fn signal_meta(&mut self, variable: &VariableRef) -> Result<VariableMeta> {
+    pub fn variable_meta(&mut self, variable: &VariableRef) -> Result<VariableMeta> {
         Ok(self
             .fetch_item(variable)
             .map(|item| VariableMeta {
@@ -530,14 +524,18 @@ impl CxxrtlContainer {
                 num_bits: Some(item.width),
                 variable_type: None,
                 index: None,
+                direction: None,
                 enum_map: Default::default(),
+                encoding: VariableEncoding::BitVector,
             })
             .unwrap_or_else(|| VariableMeta {
                 var: variable.clone(),
                 num_bits: None,
                 variable_type: None,
                 index: None,
+                direction: None,
                 enum_map: Default::default(),
+                encoding: VariableEncoding::BitVector,
             }))
     }
 
@@ -545,23 +543,24 @@ impl CxxrtlContainer {
         self.raw_simulation_status().map(|s| s.latest_time)
     }
 
-    pub fn query_signal(&mut self, signal: &VariableRef, time: &BigUint) -> QueryResult {
+    pub fn query_variable(
+        &mut self,
+        variable: &VariableRef,
+        time: &BigUint,
+    ) -> Option<QueryResult> {
         // Before we can query any signals, we need some other data available. If we don't have
         // that we'll early return with no value
-        let Some(max_timestamp) = self.max_timestamp() else {
-            return QueryResult::default();
-        };
-        let Some(info) = self.fetch_all_items() else {
-            return QueryResult::default();
-        };
+        let max_timestamp = self.max_timestamp()?;
+        let info = self.fetch_all_items()?;
         let loaded_signals = block_on(self.data.read()).loaded_signals.clone();
 
         let s = &self;
 
         let mut data = block_on(self.data.write());
-        data.query_result
+        let res = data
+            .query_result
             .fetch_if_needed(move || {
-                info!("Running query signal");
+                info!("Running query variable");
 
                 s.run_command(
                     CxxrtlCommand::query_interval {
@@ -588,20 +587,21 @@ impl CxxrtlContainer {
                 // If we get here, the cache is valid and we we should look into the
                 // interval_query_cache for the query result
                 data.interval_query_cache
-                    .query(signal, time.to_bigint().unwrap())
+                    .query(variable, time.to_bigint().unwrap())
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        Some(res)
     }
 
-    pub fn load_signals<S: AsRef<VariableRef>, T: Iterator<Item = S>>(&mut self, signals: T) {
+    pub fn load_variables<S: AsRef<VariableRef>, T: Iterator<Item = S>>(&mut self, variables: T) {
         let mut data = block_on(self.data.write());
-        for signal in signals {
-            let sigref = signal.as_ref().clone();
+        for variable in variables {
+            let varref = variable.as_ref().clone();
 
-            if !data.signal_index_map.contains_key(&sigref) {
+            if !data.signal_index_map.contains_key(&varref) {
                 let idx = data.loaded_signals.len();
-                data.signal_index_map.insert(sigref.clone(), idx);
-                data.loaded_signals.push(sigref.clone());
+                data.signal_index_map.insert(varref.clone(), idx);
+                data.loaded_signals.push(varref.clone());
             }
         }
 
@@ -619,10 +619,6 @@ impl CxxrtlContainer {
                 data.invalidate_query_result()
             },
         )
-    }
-
-    pub fn load_signal(&mut self, r: &VariableRef) {
-        self.load_signals([r].into_iter())
     }
 
     fn raw_simulation_status(&self) -> Option<CxxrtlSimulationStatus> {
