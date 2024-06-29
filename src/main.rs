@@ -92,6 +92,7 @@ use translation::tywaves_translator::TywavesTranslator;
 #[cfg(feature = "spade")]
 use translation::spade::SpadeTranslator;
 use translation::TranslatorList;
+use translation::*;
 use variable_name_filter::VariableNameFilterType;
 use viewport::Viewport;
 use wasm_util::perform_work;
@@ -366,7 +367,7 @@ fn main() -> Result<()> {
         None => State::new()?,
     }
     .with_params(StartupParams::from_args(args));
-    let app_name = "Surfer-tywaves v0.3.0";
+    let app_name = "Surfer-tywaves v0.3.1-DEV";
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(app_name)
@@ -732,12 +733,43 @@ impl State {
                 if let (Some(top), Some(state)) = (args.spade_top, args.spade_state) {
                     SpadeTranslator::load(&top, &state, sender);
                 } else if let Some(hgldd_dir) = args.hgldd_dir {
-                    TywavesTranslator::load(
-                        &hgldd_dir,
-                        sender,
-                        args.extra_scopes,
-                        args.top_module_name,
-                    );
+                    let extra_scopes = args.extra_scopes.clone();
+                    let top_module_name = args.top_module_name.clone();
+
+                    let translator_list: Vec<Box<dyn BasicTranslator>> = vec![
+                        Box::new(BitTranslator {}),
+                        Box::new(HexTranslator {}),
+                        Box::new(OctalTranslator {}),
+                        Box::new(UnsignedTranslator {}),
+                        Box::new(SignedTranslator {}),
+                        Box::new(GroupingBinaryTranslator {}),
+                        Box::new(BinaryTranslator {}),
+                        Box::new(ASCIITranslator {}),
+                        Box::new(SinglePrecisionTranslator {}),
+                        Box::new(DoublePrecisionTranslator {}),
+                        Box::new(HalfPrecisionTranslator {}),
+                        Box::new(BFloat16Translator {}),
+                        Box::new(Posit32Translator {}),
+                        Box::new(Posit16Translator {}),
+                        Box::new(Posit8Translator {}),
+                        Box::new(PositQuire8Translator {}),
+                        Box::new(PositQuire16Translator {}),
+                        Box::new(E5M2Translator {}),
+                        Box::new(E4M3Translator {}),
+                        Box::new(LebTranslator {}),
+                        #[cfg(feature = "f128")]
+                        Box::new(QuadPrecisionTranslator {}),
+                    ];
+
+                    for translator in translator_list {
+                        TywavesTranslator::load(
+                            &hgldd_dir,
+                            sender.clone(),
+                            extra_scopes.clone(),
+                            top_module_name.clone(),
+                            translator,
+                        );
+                    }
                 } else {
                     info!("spade-top and spade-state not set, not loading spade translator");
                 }
@@ -764,6 +796,7 @@ impl State {
                         &hgldd_dir,
                         extra_scopes,
                         &top_module_name,
+                        Box::new(BitTranslator {}),
                     )
                     .expect("failed to load tywaves translator");
 
