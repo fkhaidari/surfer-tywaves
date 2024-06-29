@@ -8,15 +8,19 @@ use crate::message::Message;
 use crate::translation::{Translator, ValueKind, ValueRepr};
 use crate::wasm_util::perform_work;
 use crate::wave_container::{VariableMeta, VariableValue};
+use crate::BitTranslator;
 
-use super::{TranslationPreference, TranslationResult, VariableInfo};
+use super::{BasicTranslator, TranslationPreference, TranslationResult, VariableInfo};
 
 use color_eyre::{eyre::eyre, Result}; // Add this line
 
 // Tywaves-rs
 use tywaves_rs::tyvcd::builder::GenericBuilder;
-use tywaves_rs::tyvcd::trace_pointer::{TraceFinder, TraceGetter};
+use tywaves_rs::tyvcd::trace_pointer::TraceFinder;
 use tywaves_rs::{hgldd, tyvcd::builder as tybuilder, tyvcd::spec as tyvcd};
+
+type PrefTypeTranslator = BitTranslator;
+static PREFERRED_TRANSLATOR: PrefTypeTranslator = PrefTypeTranslator {};
 
 /// Internal state of the [TywavesTranslator]
 struct TywaveState {
@@ -42,6 +46,8 @@ fn create_translation_result_name(variable: &tyvcd::Variable) -> String {
 }
 /// TywavesTranslator
 pub struct TywavesTranslator {
+    // dyn Translator
+    inner_translator: Box<dyn BasicTranslator>,
     state: TywaveState,
 }
 
@@ -69,6 +75,7 @@ impl TywavesTranslator {
         hgldd_dir: &Utf8Path,
         extra_scopes: Vec<String>,
         top_module_name: &String,
+        inner_translator: Box<dyn BasicTranslator>,
     ) -> Result<Self> {
         // Parse the hgldd directory and initialize the builder and state
         let hgldd = hgldd::reader::parse_hgldd_dir(hgldd_dir.as_ref()).map_err(|e| {
@@ -90,7 +97,10 @@ impl TywavesTranslator {
             )
         })?;
 
-        Ok(TywavesTranslator { state })
+        Ok(TywavesTranslator {
+            state,
+            inner_translator,
+        })
     }
 
     /// Rewrite the vcd file according to the tywaves internal state
@@ -119,12 +129,18 @@ impl TywavesTranslator {
         sender: Sender<Message>,
         extra_scopes: Vec<String>,
         top_module_name: String,
+        inner_translator: Box<dyn BasicTranslator>,
     ) {
         let hgldd_dir_path = hgldd_dir_path.to_owned();
 
         // Create a new thread to load the translator
         perform_work(move || {
-            match TywavesTranslator::new(&hgldd_dir_path, extra_scopes, &top_module_name) {
+            match TywavesTranslator::new(
+                &hgldd_dir_path,
+                extra_scopes,
+                &top_module_name,
+                inner_translator,
+            ) {
                 Ok(translator) => sender
                     .send(Message::TranslatorLoaded(Box::new(translator)))
                     .unwrap(),
@@ -177,7 +193,19 @@ impl TywavesTranslator {
         raw_val_vcd: &str,
     ) -> Result<TranslationResult> {
         // Create the value representation
-        let val_repr: ValueRepr = ValueRepr::String(variable.create_val_repr(raw_val_vcd));
+        let render_fn = |num_bits: u64, raw_val_vcd: &str| {
+            self.inner_translator
+                .basic_translate(num_bits, &VariableValue::String(raw_val_vcd.to_string()))
+                .0
+        };
+
+        let val_repr_str = variable.create_val_repr(raw_val_vcd, &render_fn);
+        // let val_repr = ValueRepr::String(format!(
+        //     "{} {}",
+        //     variable.high_level_info.type_name, val_repr_str
+        // ));
+        let val_repr = ValueRepr::String(val_repr_str);
+
         // Create a result based on the kind of the variable
         let result = match &variable.kind {
             // Create a bool if the variable is a ground with width 1
@@ -196,7 +224,7 @@ impl TywavesTranslator {
                     ));
                 }
 
-                let subfields = match VariableInfo::from(&variable.kind) {
+                let subfields = match self.convert_kind2info(&variable.kind) {
                     VariableInfo::Bool => vec![],
                     _ => subfields,
                 };
@@ -230,6 +258,7 @@ impl TywavesTranslator {
                         self.translate_variable(field, _val)?,
                     ));
                 }
+
                 TranslationResult {
                     val: val_repr,
                     subfields,
@@ -246,11 +275,44 @@ impl TywavesTranslator {
 
         Ok(result)
     }
+
+    // TODO: implement the conversion from tywaves types to VariableInfo
+    fn convert_kind2info(&self, real_type: &tyvcd::VariableKind) -> VariableInfo {
+        match real_type {
+            tyvcd::VariableKind::Ground(width) => {
+                if *width == 1 && self.inner_translator.name() == PREFERRED_TRANSLATOR.name() {
+                    VariableInfo::Bool
+                } else {
+                    // TODO: Change this to bits
+                    let mut subfields = vec![];
+                    for i in 0..*width {
+                        subfields.push((i.to_string(), VariableInfo::Bool));
+                    }
+                    VariableInfo::Compound { subfields }
+                }
+            }
+            tyvcd::VariableKind::Struct { fields } | tyvcd::VariableKind::Vector { fields } => {
+                VariableInfo::Compound {
+                    // TODO: Fix this
+                    subfields: fields
+                        .iter()
+                        .map(|f| {
+                            (
+                                create_translation_result_name(f),
+                                self.convert_kind2info(&f.kind),
+                            )
+                        })
+                        .collect(),
+                }
+            }
+            _ => VariableInfo::String,
+        }
+    }
 }
 
 impl Translator for TywavesTranslator {
     fn name(&self) -> String {
-        "Tywaves translator".to_string()
+        format!("Tywaves {}", self.inner_translator.name())
     }
 
     fn translate(
@@ -281,15 +343,19 @@ impl Translator for TywavesTranslator {
     fn variable_info(&self, variable: &VariableMeta) -> Result<VariableInfo> {
         let var = self.find_variable(variable)?;
         let kind = &var.read().unwrap().kind;
+
         // Convert parent var to VariableInfo
-        Ok(VariableInfo::from(kind))
+        Ok(self.convert_kind2info(kind))
     }
 
     // Tell if the variable can be translated or not
     fn translates(&self, variable: &VariableMeta) -> Result<TranslationPreference> {
-        // Get the type of the selected variable
-        if let Ok(_) = &self.find_variable(variable) {
+        if self.inner_translator.name() == PREFERRED_TRANSLATOR.name() {
+            // Prefer to translate with BitTranslator as inner translator
             Ok(TranslationPreference::Prefer)
+        } else if self.find_variable(variable).is_ok() {
+            // Get the type of the selected variable
+            Ok(TranslationPreference::Yes)
         } else {
             Ok(TranslationPreference::No)
         }
@@ -297,35 +363,5 @@ impl Translator for TywavesTranslator {
 
     fn reload(&self, _sender: Sender<Message>) {
         // TODO: Implement reload for tywaves translator
-    }
-}
-
-// TODO: implement the conversion from tywaves types to VariableInfo
-impl From<&tyvcd::VariableKind> for VariableInfo {
-    fn from(real_type: &tyvcd::VariableKind) -> Self {
-        match real_type {
-            tyvcd::VariableKind::Ground(width) => {
-                if *width == 1 {
-                    VariableInfo::Bool
-                } else {
-                    // TODO: Change this to bits
-                    let mut subfields = vec![];
-                    for i in 0..*width {
-                        subfields.push((i.to_string(), VariableInfo::Bool));
-                    }
-                    VariableInfo::Compound { subfields }
-                }
-            }
-            tyvcd::VariableKind::Struct { fields } | tyvcd::VariableKind::Vector { fields } => {
-                VariableInfo::Compound {
-                    // TODO: Fix this
-                    subfields: fields
-                        .iter()
-                        .map(|f| (create_translation_result_name(f), Self::from(&f.kind)))
-                        .collect(),
-                }
-            }
-            _ => VariableInfo::String,
-        }
     }
 }
