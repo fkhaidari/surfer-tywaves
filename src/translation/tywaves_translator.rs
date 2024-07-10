@@ -8,7 +8,7 @@ use crate::message::Message;
 use crate::translation::{Translator, ValueKind, ValueRepr};
 use crate::wasm_util::perform_work;
 use crate::wave_container::{VariableMeta, VariableValue};
-use crate::BitTranslator;
+use crate::UnsignedTranslator;
 
 use super::{BasicTranslator, TranslationPreference, TranslationResult, VariableInfo};
 
@@ -19,7 +19,7 @@ use tywaves_rs::tyvcd::builder::GenericBuilder;
 use tywaves_rs::tyvcd::trace_pointer::TraceFinder;
 use tywaves_rs::{hgldd, tyvcd::builder as tybuilder, tyvcd::spec as tyvcd};
 
-type PrefTypeTranslator = BitTranslator;
+type PrefTypeTranslator = UnsignedTranslator;
 static PREFERRED_TRANSLATOR: PrefTypeTranslator = PrefTypeTranslator {};
 
 /// Internal state of the [TywavesTranslator]
@@ -49,6 +49,7 @@ pub struct TywavesTranslator {
     // dyn Translator
     inner_translator: Box<dyn BasicTranslator>,
     state: TywaveState,
+    top_module_name: String,
 }
 
 impl TywavesTranslator {
@@ -100,11 +101,12 @@ impl TywavesTranslator {
         Ok(TywavesTranslator {
             state,
             inner_translator,
+            top_module_name: top_module_name.to_string(),
         })
     }
 
     /// Rewrite the vcd file according to the tywaves internal state
-    pub fn vcd_rewrite(&self, vcd_path: &Path) -> Result<&str> {
+    pub fn vcd_rewrite(&self, vcd_path: &Path) -> Result<String> {
         let tywaves_scopes = &self.state.tyvcd().scopes;
         // Get the list of scopes
         let scopes_def_list = tywaves_scopes
@@ -112,12 +114,16 @@ impl TywavesTranslator {
             .map(|(_, v)| (v.read().unwrap().clone()))
             .collect();
 
-        let mut vcd_rewriter = tywaves_rs::vcd_rewrite::VcdRewriter::new(vcd_path, scopes_def_list)
-            .map_err(|e| eyre!("Failed to rewrite the vcd file.\nError: {:?}", e))?;
+        let mut vcd_rewriter = tywaves_rs::vcd_rewrite::VcdRewriter::new(
+            vcd_path,
+            scopes_def_list,
+            format!("{}.vcd", self.top_module_name),
+        )
+        .map_err(|e| eyre!("Failed to rewrite the vcd file.\nError: {:?}", e))?;
         vcd_rewriter
             .rewrite()
             .map_err(|e| eyre!("Failed to rewrite the vcd file.\nError: {:?}", e))?;
-        Ok(vcd_rewriter.get_final_file())
+        Ok(vcd_rewriter.get_final_file().clone())
     }
 
     /// Load the TywavesTranslator from an input hgldd directory (optionally
@@ -350,6 +356,11 @@ impl Translator for TywavesTranslator {
 
     // Tell if the variable can be translated or not
     fn translates(&self, variable: &VariableMeta) -> Result<TranslationPreference> {
+        if let Some(b) = variable.num_bits {
+            if b == 1 {
+                return Ok(TranslationPreference::Yes);
+            }
+        }
         if self.inner_translator.name() == PREFERRED_TRANSLATOR.name() {
             // Prefer to translate with BitTranslator as inner translator
             Ok(TranslationPreference::Prefer)

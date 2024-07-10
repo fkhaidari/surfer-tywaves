@@ -367,7 +367,7 @@ fn main() -> Result<()> {
         None => State::new()?,
     }
     .with_params(StartupParams::from_args(args));
-    let app_name = "Surfer-tywaves v0.3.1-DEV";
+    let app_name = "Surfer-tywaves v0.3.1";
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(app_name)

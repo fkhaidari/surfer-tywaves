@@ -4628,7 +4628,7 @@ checksum = "81cdd64d312baedb58e21336b31bc043b77e01cc99033ce76ef539f78e965ebc"
 
 [[package]]
 name = "surfer-tywaves"
-version = "0.3.0-tywaves-dev"
+version = "0.3.1-tywaves"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -5181,7 +5181,7 @@ checksum = "42ff0bf0c66b8238c6f3b578df37d0b7848e55df8577b3f74f92a69acceeb825"
 
 [[package]]
 name = "tywaves-rs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "eyre",
  "serde",
