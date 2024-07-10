@@ -49,6 +49,7 @@ pub struct TywavesTranslator {
     // dyn Translator
     inner_translator: Box<dyn BasicTranslator>,
     state: TywaveState,
+    top_module_name: String,
 }
 
 impl TywavesTranslator {
@@ -100,11 +101,12 @@ impl TywavesTranslator {
         Ok(TywavesTranslator {
             state,
             inner_translator,
+            top_module_name: top_module_name.to_string(),
         })
     }
 
     /// Rewrite the vcd file according to the tywaves internal state
-    pub fn vcd_rewrite(&self, vcd_path: &Path) -> Result<&str> {
+    pub fn vcd_rewrite(&self, vcd_path: &Path) -> Result<String> {
         let tywaves_scopes = &self.state.tyvcd().scopes;
         // Get the list of scopes
         let scopes_def_list = tywaves_scopes
@@ -112,12 +114,16 @@ impl TywavesTranslator {
             .map(|(_, v)| (v.read().unwrap().clone()))
             .collect();
 
-        let mut vcd_rewriter = tywaves_rs::vcd_rewrite::VcdRewriter::new(vcd_path, scopes_def_list)
+        let mut vcd_rewriter = tywaves_rs::vcd_rewrite::VcdRewriter::new(
+            vcd_path,
+            scopes_def_list,
+            format!("{}.vcd", self.top_module_name),
+        )
             .map_err(|e| eyre!("Failed to rewrite the vcd file.\nError: {:?}", e))?;
         vcd_rewriter
             .rewrite()
             .map_err(|e| eyre!("Failed to rewrite the vcd file.\nError: {:?}", e))?;
-        Ok(vcd_rewriter.get_final_file())
+        Ok(vcd_rewriter.get_final_file().clone())
     }
 
     /// Load the TywavesTranslator from an input hgldd directory (optionally
