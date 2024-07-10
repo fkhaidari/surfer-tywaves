@@ -1,6 +1,6 @@
 [package]
 name = "surfer-tywaves"
-version = "0.3.0-tywaves-dev"
+version = "0.3.1-tywaves"
 edition = "2021"
 license = "EUPL-1.2"
 categories = ["development-tools::debugging", "science"]
