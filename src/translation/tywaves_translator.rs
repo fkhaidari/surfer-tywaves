@@ -8,7 +8,7 @@ use crate::message::Message;
 use crate::translation::{Translator, ValueKind, ValueRepr};
 use crate::wasm_util::perform_work;
 use crate::wave_container::{VariableMeta, VariableValue};
-use crate::BitTranslator;
+use crate::UnsignedTranslator;
 
 use super::{BasicTranslator, TranslationPreference, TranslationResult, VariableInfo};
 
@@ -19,7 +19,7 @@ use tywaves_rs::tyvcd::builder::GenericBuilder;
 use tywaves_rs::tyvcd::trace_pointer::TraceFinder;
 use tywaves_rs::{hgldd, tyvcd::builder as tybuilder, tyvcd::spec as tyvcd};
 
-type PrefTypeTranslator = BitTranslator;
+type PrefTypeTranslator = UnsignedTranslator;
 static PREFERRED_TRANSLATOR: PrefTypeTranslator = PrefTypeTranslator {};
 
 /// Internal state of the [TywavesTranslator]
@@ -119,7 +119,7 @@ impl TywavesTranslator {
             scopes_def_list,
             format!("{}.vcd", self.top_module_name),
         )
-            .map_err(|e| eyre!("Failed to rewrite the vcd file.\nError: {:?}", e))?;
+        .map_err(|e| eyre!("Failed to rewrite the vcd file.\nError: {:?}", e))?;
         vcd_rewriter
             .rewrite()
             .map_err(|e| eyre!("Failed to rewrite the vcd file.\nError: {:?}", e))?;
@@ -356,6 +356,11 @@ impl Translator for TywavesTranslator {
 
     // Tell if the variable can be translated or not
     fn translates(&self, variable: &VariableMeta) -> Result<TranslationPreference> {
+        if let Some(b) = variable.num_bits {
+            if b == 1 {
+                return Ok(TranslationPreference::Yes);
+            }
+        }
         if self.inner_translator.name() == PREFERRED_TRANSLATOR.name() {
             // Prefer to translate with BitTranslator as inner translator
             Ok(TranslationPreference::Prefer)
