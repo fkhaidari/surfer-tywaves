@@ -91,12 +91,19 @@ impl TywavesTranslator {
                 .with_extra_artifact_scopes(extra_scopes, top_module_name),
         };
         // Build the tyvcd state
-        state.builder.build().map_err(|e| {
-            eyre!(
-                "Failed to build the Tywaves state from the hgldd directory.\nError: {:?}",
-                e
-            )
-        })?;
+        let res_build = state.builder.build();
+        match res_build {
+            Ok(_) => Ok(()),
+            Err(e) => match e {
+                tybuilder::BuilderError::MissingTraceValue(_) => Ok(()),
+                tybuilder::BuilderError::MissingTraceValueRequired(_)
+                | tybuilder::BuilderError::FailedToBuildVariable(_)
+                | tybuilder::BuilderError::GenericFailure(_) => Err(eyre!(
+                    "Failed to build the Tywaves state from the hgldd directory.\nError: {:?}",
+                    e
+                )),
+            },
+        }?;
 
         Ok(TywavesTranslator {
             state,
