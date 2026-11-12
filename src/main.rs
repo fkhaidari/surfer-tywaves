@@ -723,16 +723,14 @@ impl State {
 
         // Long running translators which we load in a thread
         {
-            #[cfg(feature = "spade")]
             let sender = self.sys.channels.msg_sender.clone();
-            #[cfg(not(feature = "spade"))]
-            let _ = self.sys.channels.msg_sender.clone();
             perform_work(move || {
                 #[cfg(feature = "spade")]
                 // Here the spade is given
                 if let (Some(top), Some(state)) = (args.spade_top, args.spade_state) {
-                    SpadeTranslator::load(&top, &state, sender);
-                } else if let Some(hgldd_dir) = args.hgldd_dir {
+                    SpadeTranslator::load(&top, &state, sender.clone());
+                }
+                if let Some(hgldd_dir) = args.hgldd_dir {
                     let extra_scopes = args.extra_scopes.clone();
                     let top_module_name = args.top_module_name.clone();
 
